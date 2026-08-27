@@ -46,9 +46,7 @@ pub fn sections(body: &str) -> Vec<Section> {
     for line in &lines {
         let trimmed = line.text.trim_start();
         if let Some((character, length)) = fence {
-            if fence_marker(trimmed)
-                .is_some_and(|(next, count)| next == character && count >= length)
-            {
+            if is_closing_fence(trimmed, character, length) {
                 fence = None;
             }
             continue;
@@ -158,9 +156,7 @@ pub fn checklist_items(body: &str) -> Vec<ChecklistItem> {
     for line in lines(body) {
         let trimmed = line.text.trim_start();
         if let Some((character, length)) = fence {
-            if fence_marker(trimmed)
-                .is_some_and(|(next, count)| next == character && count >= length)
-            {
+            if is_closing_fence(trimmed, character, length) {
                 fence = None;
             }
             continue;
@@ -377,6 +373,11 @@ fn fence_marker(line: &str) -> Option<(char, usize)> {
     (count >= 3).then_some((character, count))
 }
 
+fn is_closing_fence(line: &str, character: char, minimum_length: usize) -> bool {
+    let count = line.chars().take_while(|next| *next == character).count();
+    count >= minimum_length && line[count..].trim().is_empty()
+}
+
 fn atx_heading(line: &str) -> Option<(u8, &str)> {
     let count = line.bytes().take_while(|byte| *byte == b'#').count();
     if !(1..=6).contains(&count) {
@@ -387,8 +388,12 @@ fn atx_heading(line: &str) -> Option<(u8, &str)> {
         return None;
     }
     let mut title = rest.trim();
-    if let Some(without_hashes) = title.strip_suffix('#') {
-        title = without_hashes.trim_end_matches('#').trim_end();
+    let trailing_hashes = title.bytes().rev().take_while(|byte| *byte == b'#').count();
+    if trailing_hashes > 0 {
+        let without_hashes = &title[..title.len() - trailing_hashes];
+        if without_hashes.ends_with([' ', '\t']) {
+            title = without_hashes.trim_end();
+        }
     }
     (!title.is_empty()).then_some((count as u8, title))
 }
@@ -396,22 +401,53 @@ fn atx_heading(line: &str) -> Option<(u8, &str)> {
 /// Returns the offset of the checkbox state character relative to `line`.
 fn checkbox(line: &str) -> Option<(usize, bool, &str)> {
     let bytes = line.as_bytes();
-    if bytes.len() < 6
-        || !matches!(bytes[0], b'-' | b'*' | b'+')
-        || bytes[1] != b' '
-        || bytes[2] != b'['
-    {
+    if bytes.len() < 5 {
         return None;
     }
-    let checked = match bytes[3] {
+    let marker_end = if matches!(bytes[0], b'-' | b'*' | b'+') {
+        1
+    } else {
+        let digits = bytes
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if digits == 0
+            || digits > 9
+            || !bytes
+                .get(digits)
+                .is_some_and(|byte| matches!(byte, b'.' | b')'))
+        {
+            return None;
+        }
+        digits + 1
+    };
+    let whitespace = bytes[marker_end..]
+        .iter()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    if whitespace == 0 {
+        return None;
+    }
+    let bracket = marker_end + whitespace;
+    if bytes.get(bracket) != Some(&b'[') {
+        return None;
+    }
+    let checked = match bytes.get(bracket + 1)? {
         b' ' => false,
         b'x' | b'X' => true,
         _ => return None,
     };
-    if bytes[4] != b']' || !matches!(bytes[5], b' ' | b'\t') {
+    if bytes.get(bracket + 2) != Some(&b']') {
         return None;
     }
-    Some((3, checked, line[6..].trim_end()))
+    let content_start = bracket + 3;
+    if bytes
+        .get(content_start)
+        .is_some_and(|byte| !matches!(byte, b' ' | b'\t'))
+    {
+        return None;
+    }
+    Some((bracket + 1, checked, line[content_start..].trim()))
 }
 
 fn validate_heading(title: &str) -> Result<()> {
@@ -450,7 +486,7 @@ mod tests {
 
     #[test]
     fn ignores_headings_and_checkboxes_inside_fences() {
-        let body = "## Real\n\n```md\n## Fake\n- [ ] fake\n```\n\n- [ ] real\n";
+        let body = "## Real\n\n```md\n## Fake\n- [ ] fake\n```still code\n## Also fake\n```\n\n- [ ] real\n";
         assert_eq!(sections(body).len(), 1);
         let items = checklist_items(body);
         assert_eq!(items.len(), 1);
@@ -526,5 +562,25 @@ mod tests {
     fn global_toggle_changes_only_one_state_byte() {
         let toggled = toggle_checklist_global(BODY, 2).unwrap();
         assert_eq!(toggled, BODY.replacen("- [x] Second", "- [ ] Second", 1));
+    }
+
+    #[test]
+    fn preserves_hashes_that_are_part_of_heading_text() {
+        let body = "## C#\n\nText\n\n## Closed heading ###\n";
+        let found = sections(body);
+        assert_eq!(found[0].title, "C#");
+        assert_eq!(found[1].title, "Closed heading");
+    }
+
+    #[test]
+    fn parses_ordered_and_spaced_task_list_markers() {
+        let body = "## Checks\n\n1. [ ] ordered\n-   [X] spaced\n* [ ] ordinary\n";
+        let items = checklist_items(body);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].text, "ordered");
+        assert!(items[1].checked);
+
+        let toggled = toggle_checklist_global(body, 1).unwrap();
+        assert!(toggled.contains("1. [x] ordered"));
     }
 }
