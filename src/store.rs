@@ -174,12 +174,31 @@ impl Project {
     {
         let _lock = self.lock()?;
         let project = Self::open(&self.root)?;
-        let cards = project.load_cards_unvalidated()?;
+        let mut cards = project.load_cards_unvalidated()?;
         validate_collection(&cards, &project.config)?;
-        let mut card = find_unique_card(cards.clone(), id)?;
+        let selected = find_unique_card(cards.clone(), id)?;
+        let original = fs::read_to_string(&selected.path)
+            .with_context(|| format!("could not re-read {}", selected.path.display()))?;
+        // The parsed value and optimistic-concurrency baseline must come from the same bytes.
+        // Otherwise an external write between the directory scan and this read could be accepted
+        // as the baseline while stale parsed content is written over it.
+        let mut card = parse_card_source(&selected.path, &original)?;
+        if !card.metadata.id.eq_ignore_ascii_case(id.trim()) {
+            bail!(
+                "{} changed identity from {:?} to {:?} during the update; retry the command",
+                selected.path.display(),
+                id.trim(),
+                card.metadata.id
+            );
+        }
+        if let Some(current) = cards
+            .iter_mut()
+            .find(|current| current.path == selected.path)
+        {
+            current.clone_from(&card);
+        }
+        validate_collection(&cards, &project.config)?;
         let previous_status = card.metadata.status.clone();
-        let original = fs::read_to_string(&card.path)
-            .with_context(|| format!("could not re-read {}", card.path.display()))?;
 
         mutate(&mut card)?;
         card.metadata.title = card.metadata.title.trim().to_owned();
@@ -336,7 +355,11 @@ fn card_paths(cards_dir: &Path) -> Result<Vec<PathBuf>> {
 fn load_card_path(path: &Path) -> Result<Card> {
     let source = fs::read_to_string(path)
         .with_context(|| format!("could not read card {}", path.display()))?;
-    let document = frontmatter::parse::<CardMetadata>(&source)
+    parse_card_source(path, &source)
+}
+
+fn parse_card_source(path: &Path, source: &str) -> Result<Card> {
+    let document = frontmatter::parse::<CardMetadata>(source)
         .with_context(|| format!("could not parse card {}", path.display()))?;
     document
         .metadata
@@ -633,6 +656,32 @@ mod tests {
 
         project.move_card(&created.metadata.id, "Done").unwrap();
         assert_eq!(project.load_card(&created.metadata.id).unwrap().body, body);
+    }
+
+    #[test]
+    fn an_external_write_during_mutation_is_never_overwritten() {
+        let (_directory, project) = project();
+        let created = project
+            .create_card(CreateCard {
+                title: "Original".to_owned(),
+                body: "Original body".to_owned(),
+                ..CreateCard::default()
+            })
+            .unwrap();
+        let mut external = created.clone();
+        external.metadata.title = "External edit".to_owned();
+        external.body = "External body".to_owned();
+        let external_source = frontmatter::serialize(&external.metadata, &external.body).unwrap();
+        let path = created.path.clone();
+
+        let result = project.update_card(&created.metadata.id, |card| {
+            fs::write(&path, &external_source)?;
+            card.metadata.title = "Stale kbmd edit".to_owned();
+            Ok(())
+        });
+
+        assert!(result.unwrap_err().to_string().contains("changed during"));
+        assert_eq!(fs::read_to_string(path).unwrap(), external_source);
     }
 
     #[test]

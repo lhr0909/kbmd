@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::process::{Command as ProcessCommand, Stdio};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -199,4 +200,58 @@ fn board_json_has_a_versioned_envelope() {
         json["data"]["columns"][0]["cards"][0]["metadata"]["id"],
         "DEMO-1"
     );
+}
+
+#[test]
+fn concurrent_cli_creates_do_not_collide() {
+    let directory = initialized();
+    let binary = assert_cmd::cargo::cargo_bin!("kbmd");
+    let children = (0..8)
+        .map(|index| {
+            ProcessCommand::new(binary)
+                .arg("--project")
+                .arg(directory.path())
+                .arg("add")
+                .arg(format!("Concurrent {index}"))
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "concurrent create failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let output = kbmd(directory.path())
+        .args(["list", "--json"])
+        .output()
+        .unwrap();
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["data"].as_array().unwrap().len(), 8);
+}
+
+#[test]
+fn failed_checklist_mutation_leaves_file_unchanged() {
+    let directory = initialized();
+    kbmd(directory.path())
+        .args(["add", "Safe", "--check", "Release=Existing"])
+        .assert()
+        .success();
+    let path = directory.path().join(".kbmd/cards/DEMO-1.md");
+    let before = fs::read(&path).unwrap();
+
+    kbmd(directory.path())
+        .args(["check", "toggle", "DEMO-1", "Release", "99"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("was not found"));
+
+    assert_eq!(fs::read(path).unwrap(), before);
 }
