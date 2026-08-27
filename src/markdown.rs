@@ -201,7 +201,43 @@ pub fn add_checklist_item(body: &str, section: &str, text: &str) -> Result<Strin
     if text.trim().is_empty() {
         bail!("checklist text cannot be empty");
     }
-    append_section(body, section, &format!("- [ ] {}", text.trim()))
+    let line = format!("- [ ] {}", text.trim());
+    let Some(target) = unique_section(body, section)? else {
+        return set_section(body, section, &line);
+    };
+    let insertion_end = sections(body)
+        .into_iter()
+        .find(|candidate| {
+            candidate.start >= target.content_start
+                && candidate.start < target.end
+                && candidate.level > target.level
+        })
+        .map_or(target.end, |child| child.start);
+    let direct_content = body[target.content_start..insertion_end].trim_matches(['\r', '\n']);
+    let separator = if direct_content.is_empty() {
+        ""
+    } else if direct_content
+        .lines()
+        .next_back()
+        .and_then(|last| checkbox(last.trim_start()))
+        .is_some()
+    {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    let replacement = format!("\n{direct_content}{separator}{line}\n");
+    let mut result = String::with_capacity(body.len() + replacement.len());
+    result.push_str(&body[..target.content_start]);
+    result.push_str(&replacement);
+    if insertion_end < body.len() {
+        result.push('\n');
+        result.push_str(body[insertion_end..].trim_start_matches(['\r', '\n']));
+    }
+    if body.ends_with('\n') && !result.ends_with('\n') {
+        result.push('\n');
+    }
+    Ok(result)
 }
 
 pub fn set_checklist_item(
@@ -458,6 +494,16 @@ mod tests {
             .find(|item| item.section.as_deref() == Some("Notes"))
             .unwrap();
         assert_eq!(note_item.text, "Call Alice");
+
+        let adjacent = add_checklist_item(&toggled, "Plan", "Third").unwrap();
+        assert!(adjacent.contains("- [x] First\n- [x] Second\n- [ ] Third\n\n### Detail"));
+        assert_eq!(
+            checklist_items(&adjacent)
+                .iter()
+                .filter(|item| item.section.as_deref() == Some("Plan"))
+                .count(),
+            3
+        );
 
         let removed = remove_checklist_item(&added, "Plan", 2).unwrap();
         assert_eq!(
