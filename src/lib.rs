@@ -6,6 +6,7 @@ pub mod frontmatter;
 pub mod markdown;
 pub mod model;
 pub mod store;
+pub mod tui;
 
 pub use config::{BoardConfig, ColumnConfig};
 pub use model::{Card, CardMetadata};

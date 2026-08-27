@@ -22,8 +22,7 @@ const JSON_SCHEMA_VERSION: u8 = 1;
     name = "kbmd",
     version,
     about = "A flexible, Markdown-native kanban",
-    long_about = "Manage local YAML-frontmatter Markdown cards from a scriptable CLI. Card bodies, sections, checklists, and non-reserved frontmatter are user-defined.",
-    arg_required_else_help = true
+    long_about = "Manage local YAML-frontmatter Markdown cards from a scriptable CLI or a mouse-friendly live terminal board. Card bodies, sections, checklists, and non-reserved frontmatter are user-defined."
 )]
 pub struct Cli {
     /// Project directory or any path below it.
@@ -37,11 +36,13 @@ pub struct Cli {
     project: PathBuf,
 
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Open the live keyboard- and mouse-driven terminal board.
+    Tui,
     /// Initialize `.kbmd` in a directory.
     Init(InitArgs),
     /// Create a card.
@@ -98,7 +99,7 @@ struct AddArgs {
     #[arg(long)]
     due: Option<String>,
     /// Complete Markdown body.
-    #[arg(long, conflicts_with = "body_file")]
+    #[arg(long, conflicts_with = "body_file", allow_hyphen_values = true)]
     body: Option<String>,
     /// Read the complete Markdown body from a file, or `-` for stdin.
     #[arg(long, value_name = "PATH", conflicts_with = "body")]
@@ -193,6 +194,7 @@ enum FieldCommand {
     Set {
         id: String,
         key: String,
+        #[arg(allow_hyphen_values = true)]
         value: String,
         #[arg(long)]
         yaml: bool,
@@ -230,6 +232,7 @@ struct SectionContentArgs {
     id: String,
     heading: String,
     /// Markdown content. Omit it for an empty section or when using `--file`.
+    #[arg(allow_hyphen_values = true)]
     content: Option<String>,
     /// Read Markdown from a file, or `-` for stdin.
     #[arg(long, value_name = "PATH", conflicts_with = "content")]
@@ -256,6 +259,7 @@ enum CheckCommand {
     Add {
         id: String,
         section: String,
+        #[arg(allow_hyphen_values = true)]
         text: String,
     },
     /// Invert an item's state. Indexes are one-based within the section.
@@ -282,6 +286,14 @@ enum CheckCommand {
         section: String,
         index: usize,
     },
+    /// Invert an item by its global document-order index.
+    ToggleGlobal { id: String, index: usize },
+    /// Mark an item checked by its global document-order index.
+    CheckGlobal { id: String, index: usize },
+    /// Mark an item unchecked by its global document-order index.
+    UncheckGlobal { id: String, index: usize },
+    /// Remove an item by its global document-order index.
+    RemoveGlobal { id: String, index: usize },
 }
 
 #[derive(Debug, Args)]
@@ -328,25 +340,39 @@ pub fn run() -> Result<()> {
 
 pub fn run_with(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Init(arguments) => command_init(&cli.project, arguments),
-        Command::Add(arguments) => command_add(&cli.project, arguments),
-        Command::List(arguments) => command_list(&cli.project, arguments),
-        Command::Show(arguments) => command_show(&cli.project, arguments),
-        Command::Edit(arguments) => command_edit(&cli.project, arguments),
-        Command::Move(arguments) => command_move(&cli.project, arguments),
-        Command::Field(arguments) => command_field(&cli.project, arguments.command),
-        Command::Section(arguments) => command_section(&cli.project, arguments.command),
-        Command::Check(arguments) => command_check(&cli.project, arguments.command),
-        Command::Board(arguments) => command_board(&cli.project, arguments),
-        Command::Validate => command_validate(&cli.project),
+        None | Some(Command::Tui) => command_tui(&cli.project),
+        Some(Command::Init(arguments)) => command_init(&cli.project, arguments),
+        Some(Command::Add(arguments)) => command_add(&cli.project, arguments),
+        Some(Command::List(arguments)) => command_list(&cli.project, arguments),
+        Some(Command::Show(arguments)) => command_show(&cli.project, arguments),
+        Some(Command::Edit(arguments)) => command_edit(&cli.project, arguments),
+        Some(Command::Move(arguments)) => command_move(&cli.project, arguments),
+        Some(Command::Field(arguments)) => command_field(&cli.project, arguments.command),
+        Some(Command::Section(arguments)) => command_section(&cli.project, arguments.command),
+        Some(Command::Check(arguments)) => command_check(&cli.project, arguments.command),
+        Some(Command::Board(arguments)) => command_board(&cli.project, arguments),
+        Some(Command::Validate) => command_validate(&cli.project),
     }
 }
 
+fn command_tui(start: &Path) -> Result<()> {
+    let project = Project::discover(start)?;
+    crate::tui::run(project)
+}
+
 fn command_init(root: &Path, arguments: InitArgs) -> Result<()> {
+    let absolute_root = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("could not read the current directory")?
+            .join(root)
+    };
     let name = arguments.name.unwrap_or_else(|| {
-        root.file_name()
+        absolute_root
+            .file_name()
             .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty() && *name != ".")
+            .filter(|name| !name.is_empty())
             .unwrap_or("Kanban")
             .to_owned()
     });
@@ -426,7 +452,7 @@ fn command_list(start: &Path, arguments: ListArgs) -> Result<()> {
         .filter(|card| {
             canonical_status
                 .as_deref()
-                .is_none_or(|status| card.metadata.status == status)
+                .is_none_or(|status| card.metadata.status.eq_ignore_ascii_case(status))
                 && arguments.label.as_deref().is_none_or(|label| {
                     card.metadata
                         .labels
@@ -709,6 +735,26 @@ fn command_check(start: &Path, command: CheckCommand) -> Result<()> {
                 markdown::remove_checklist_item(body, &section, index)
             })
         }
+        CheckCommand::ToggleGlobal { id, index } => {
+            mutate_checklist(&project, &id, "global", |body| {
+                markdown::toggle_checklist_global(body, index)
+            })
+        }
+        CheckCommand::CheckGlobal { id, index } => {
+            mutate_checklist(&project, &id, "global", |body| {
+                markdown::set_checklist_global(body, index, true)
+            })
+        }
+        CheckCommand::UncheckGlobal { id, index } => {
+            mutate_checklist(&project, &id, "global", |body| {
+                markdown::set_checklist_global(body, index, false)
+            })
+        }
+        CheckCommand::RemoveGlobal { id, index } => {
+            mutate_checklist(&project, &id, "global", |body| {
+                markdown::remove_checklist_global(body, index)
+            })
+        }
     }
 }
 
@@ -724,7 +770,7 @@ fn command_board(start: &Path, arguments: BoardArgs) -> Result<()> {
                 name: &column.name,
                 cards: cards
                     .iter()
-                    .filter(|card| card.metadata.status == column.name)
+                    .filter(|card| card.metadata.status.eq_ignore_ascii_case(&column.name))
                     .map(card_output)
                     .collect(),
             })
@@ -738,7 +784,7 @@ fn command_board(start: &Path, arguments: BoardArgs) -> Result<()> {
         for column in &project.config.columns {
             let column_cards = cards
                 .iter()
-                .filter(|card| card.metadata.status == column.name)
+                .filter(|card| card.metadata.status.eq_ignore_ascii_case(&column.name))
                 .collect::<Vec<_>>();
             if let Some(limit) = column.wip_limit {
                 println!("\n{} ({}/{limit})", column.name, column_cards.len());

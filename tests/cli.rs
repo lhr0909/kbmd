@@ -182,6 +182,31 @@ fn validation_reports_malformed_files() {
 }
 
 #[test]
+fn read_only_show_survives_an_unrelated_malformed_card() {
+    let directory = initialized();
+    kbmd(directory.path())
+        .args(["add", "Still readable"])
+        .assert()
+        .success();
+    fs::write(
+        directory.path().join(".kbmd/cards/broken.md"),
+        "not frontmatter\n",
+    )
+    .unwrap();
+
+    kbmd(directory.path())
+        .args(["show", "DEMO-1", "--raw"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Still readable"));
+    kbmd(directory.path())
+        .args(["show", "DEMO-1", "--path"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("DEMO-1.md"));
+}
+
+#[test]
 fn board_json_has_a_versioned_envelope() {
     let directory = initialized();
     kbmd(directory.path())
@@ -254,4 +279,150 @@ fn failed_checklist_mutation_leaves_file_unchanged() {
         .stderr(predicate::str::contains("was not found"));
 
     assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn valid_noncanonical_status_casing_still_appears_everywhere() {
+    let directory = initialized();
+    kbmd(directory.path())
+        .args(["add", "Manual casing", "--status", "Doing"])
+        .assert()
+        .success();
+    let path = directory.path().join(".kbmd/cards/DEMO-1.md");
+    let source = fs::read_to_string(&path).unwrap();
+    fs::write(&path, source.replace("status: Doing", "status: doing")).unwrap();
+
+    kbmd(directory.path()).args(["validate"]).assert().success();
+    kbmd(directory.path())
+        .args(["list", "--status", "Doing"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("DEMO-1"));
+    kbmd(directory.path())
+        .args(["board"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("DEMO-1"));
+
+    let output = kbmd(directory.path())
+        .args(["board", "--json"])
+        .output()
+        .unwrap();
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["data"]["columns"][1]["cards"][0]["metadata"]["id"],
+        "DEMO-1"
+    );
+}
+
+#[test]
+fn init_defaults_to_current_directory_name_and_normalizes_prefix() {
+    let directory = tempfile::tempdir().unwrap();
+    let expected_name = directory.path().file_name().unwrap().to_str().unwrap();
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("kbmd"));
+    command
+        .current_dir(directory.path())
+        .args(["init", "--prefix", " KB "])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "Initialized {expected_name}"
+        )));
+
+    kbmd(directory.path())
+        .args(["add", "Normalized"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Created KB-1"));
+    assert!(directory.path().join(".kbmd/cards/KB-1.md").is_file());
+}
+
+#[test]
+fn help_advertises_the_tui_and_display_controls_are_rejected() {
+    Command::new(assert_cmd::cargo::cargo_bin!("kbmd"))
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("tui"));
+
+    let directory = initialized();
+    kbmd(directory.path())
+        .args(["add", "first line\nsecond line"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("control characters"));
+    assert!(
+        fs::read_dir(directory.path().join(".kbmd/cards"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn global_checklist_commands_can_mutate_preamble_items() {
+    let directory = initialized();
+    kbmd(directory.path())
+        .args(["add", "Preamble", "--body", "- [ ] first\n- [ ] second\n"])
+        .assert()
+        .success();
+
+    kbmd(directory.path())
+        .args(["check", "check-global", "DEMO-1", "1"])
+        .assert()
+        .success();
+    kbmd(directory.path())
+        .args(["check", "toggle-global", "DEMO-1", "2"])
+        .assert()
+        .success();
+    kbmd(directory.path())
+        .args(["check", "uncheck-global", "DEMO-1", "1"])
+        .assert()
+        .success();
+    kbmd(directory.path())
+        .args(["check", "remove-global", "DEMO-1", "1"])
+        .assert()
+        .success();
+
+    kbmd(directory.path())
+        .args(["show", "DEMO-1", "--raw"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("- [x] second"))
+        .stdout(predicate::str::contains("first").not());
+}
+
+#[test]
+fn markdown_and_field_values_may_begin_with_hyphens() {
+    let directory = initialized();
+    kbmd(directory.path())
+        .args(["add", "Hyphen values"])
+        .assert()
+        .success();
+
+    kbmd(directory.path())
+        .args(["section", "set", "DEMO-1", "Plan", "- [ ] first"])
+        .assert()
+        .success();
+    kbmd(directory.path())
+        .args(["check", "add", "DEMO-1", "Plan", "- follow-up"])
+        .assert()
+        .success();
+    kbmd(directory.path())
+        .args(["field", "set", "DEMO-1", "offset", "-1", "--yaml"])
+        .assert()
+        .success();
+
+    let output = kbmd(directory.path())
+        .args(["show", "DEMO-1", "--json"])
+        .output()
+        .unwrap();
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["data"]["metadata"]["offset"], -1);
+    assert!(
+        json["data"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("- [ ] - follow-up")
+    );
 }
