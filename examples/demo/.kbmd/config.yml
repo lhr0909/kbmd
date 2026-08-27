@@ -1,0 +1,18 @@
+version: 1
+name: kbmd flexible demo
+cards_dir: cards
+id_prefix: DEMO
+default_status: Ideas
+columns:
+- name: Ideas
+  color: gray
+- name: Ready
+  color: blue
+- name: Doing
+  color: yellow
+  wip_limit: 3
+- name: Review
+  color: magenta
+  wip_limit: 2
+- name: Done
+  color: green
