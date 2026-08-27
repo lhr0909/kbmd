@@ -54,16 +54,23 @@ impl Project {
     pub fn init(root: &Path, config: &BoardConfig) -> Result<Self> {
         config.validate()?;
         let root = absolute_path(root)?;
+        fs::create_dir_all(&root)
+            .with_context(|| format!("could not create project directory {}", root.display()))?;
         let internal_dir = root.join(INTERNAL_DIR);
+        reject_internal_symlink(&internal_dir)?;
         let config_path = internal_dir.join(CONFIG_FILE);
         if config_path.exists() {
             bail!("a kbmd project already exists at {}", root.display());
         }
 
-        let cards_dir = internal_dir.join(&config.cards_dir);
-        fs::create_dir_all(&cards_dir)
-            .with_context(|| format!("could not create {}", cards_dir.display()))?;
-        atomic_write_new(&internal_dir.join(".gitignore"), b".lock\n*.tmp\n")?;
+        fs::create_dir_all(&internal_dir)
+            .with_context(|| format!("could not create {}", internal_dir.display()))?;
+        ensure_internal_is_contained(&root, &internal_dir)?;
+        ensure_contained_directory(&internal_dir, Path::new(&config.cards_dir))?;
+        let ignore_path = internal_dir.join(".gitignore");
+        if !ignore_path.exists() {
+            atomic_write_new(&ignore_path, b".lock\n*.tmp\n")?;
+        }
         let rendered = serialize_yaml(&config)?;
         atomic_write_new(&config_path, rendered.as_bytes())?;
 
@@ -93,15 +100,15 @@ impl Project {
     pub fn open(root: &Path) -> Result<Self> {
         let root = absolute_path(root)?;
         let internal_dir = root.join(INTERNAL_DIR);
+        reject_internal_symlink(&internal_dir)?;
+        ensure_internal_is_contained(&root, &internal_dir)?;
         let config_path = internal_dir.join(CONFIG_FILE);
         let source = fs::read_to_string(&config_path)
             .with_context(|| format!("could not read {}", config_path.display()))?;
         let config: BoardConfig =
             serde_saphyr::from_str(&source).context("invalid kbmd config YAML")?;
         config.validate()?;
-        let cards_dir = internal_dir.join(&config.cards_dir);
-        fs::create_dir_all(&cards_dir)
-            .with_context(|| format!("could not create {}", cards_dir.display()))?;
+        let cards_dir = ensure_contained_directory(&internal_dir, Path::new(&config.cards_dir))?;
 
         Ok(Self {
             root,
@@ -120,7 +127,12 @@ impl Project {
     }
 
     pub fn load_card(&self, id: &str) -> Result<Card> {
-        let cards = self.load_cards_unvalidated()?;
+        // Read-only lookup remains useful when an unrelated hand-edited card is temporarily
+        // malformed. Mutations still load and validate the entire collection before writing.
+        let cards = card_paths(&self.cards_dir)?
+            .into_iter()
+            .filter_map(|path| load_card_path(&path).ok())
+            .collect();
         find_unique_card(cards, id)
     }
 
@@ -199,8 +211,16 @@ impl Project {
         }
         validate_collection(&cards, &project.config)?;
         let previous_status = card.metadata.status.clone();
+        let stable_id = card.metadata.id.clone();
+        let stable_path = card.path.clone();
 
         mutate(&mut card)?;
+        if card.metadata.id != stable_id {
+            bail!("card identity cannot be changed through an update");
+        }
+        if card.path != stable_path {
+            bail!("card path cannot be changed through an update");
+        }
         card.metadata.title = card.metadata.title.trim().to_owned();
         card.metadata.validate()?;
         reject_reserved_extra_keys(&card.metadata.extra)?;
@@ -222,6 +242,10 @@ impl Project {
         card.metadata.labels = unique_nonempty(card.metadata.labels);
         card.metadata.assignees = unique_nonempty(card.metadata.assignees);
         card.metadata.touch();
+        if let Some(current) = cards.iter_mut().find(|current| current.path == stable_path) {
+            current.clone_from(&card);
+        }
+        validate_collection(&cards, &project.config)?;
 
         let rendered = frontmatter::serialize(&card.metadata, &card.body)?;
         atomic_replace_if_unchanged(&card.path, original.as_bytes(), rendered.as_bytes())?;
@@ -282,6 +306,24 @@ impl Project {
                 });
             }
         }
+        for column in &self.config.columns {
+            let Some(limit) = column.wip_limit else {
+                continue;
+            };
+            let count = cards
+                .iter()
+                .filter(|card| card.metadata.status.eq_ignore_ascii_case(&column.name))
+                .count();
+            if count > limit {
+                issues.push(ValidationIssue {
+                    path: self.config_path.clone(),
+                    message: format!(
+                        "column {:?} contains {count} cards, exceeding its WIP limit of {limit}",
+                        column.name
+                    ),
+                });
+            }
+        }
         issues.sort_by(|left, right| left.path.cmp(&right.path));
         issues
     }
@@ -321,6 +363,87 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
             .context("could not read the current directory")?
             .join(path))
     }
+}
+
+fn reject_internal_symlink(internal_dir: &Path) -> Result<()> {
+    match fs::symlink_metadata(internal_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!(
+                "refusing symlinked project directory {}",
+                internal_dir.display()
+            )
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "could not inspect project directory {}",
+                internal_dir.display()
+            )
+        }),
+    }
+}
+
+fn ensure_internal_is_contained(root: &Path, internal_dir: &Path) -> Result<()> {
+    let canonical_root = fs::canonicalize(root)
+        .with_context(|| format!("could not resolve project directory {}", root.display()))?;
+    let canonical_internal = fs::canonicalize(internal_dir)
+        .with_context(|| format!("could not resolve {}", internal_dir.display()))?;
+    if !canonical_internal.starts_with(&canonical_root) {
+        bail!(
+            "project directory {} resolves outside {}",
+            canonical_internal.display(),
+            canonical_root.display()
+        );
+    }
+    Ok(())
+}
+
+/// Create a configured directory one component at a time, resolving every existing component
+/// before any deeper write. This prevents a symlink inside `.kbmd` from redirecting creation into
+/// an unrelated directory.
+fn ensure_contained_directory(internal_dir: &Path, relative: &Path) -> Result<PathBuf> {
+    let canonical_internal = fs::canonicalize(internal_dir)
+        .with_context(|| format!("could not resolve {}", internal_dir.display()))?;
+    let mut current = canonical_internal.clone();
+
+    for component in relative.components() {
+        let std::path::Component::Normal(segment) = component else {
+            continue;
+        };
+        let candidate = current.join(segment);
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Err(create_error) = fs::create_dir(&candidate)
+                    && create_error.kind() != std::io::ErrorKind::AlreadyExists
+                {
+                    return Err(create_error)
+                        .with_context(|| format!("could not create {}", candidate.display()));
+                }
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("could not inspect {}", candidate.display()));
+            }
+        }
+
+        let resolved = fs::canonicalize(&candidate)
+            .with_context(|| format!("could not resolve {}", candidate.display()))?;
+        if !resolved.starts_with(&canonical_internal) {
+            bail!(
+                "cards directory {} resolves outside {}",
+                resolved.display(),
+                canonical_internal.display()
+            );
+        }
+        if !resolved.is_dir() {
+            bail!("cards path {} is not a directory", resolved.display());
+        }
+        current = resolved;
+    }
+
+    Ok(current)
 }
 
 fn serialize_yaml<T: Serialize>(value: &T) -> Result<String> {
@@ -550,8 +673,14 @@ fn atomic_replace_if_unchanged(path: &Path, expected: &[u8], contents: &[u8]) ->
             path.display()
         );
     }
+    let permissions = fs::metadata(path)
+        .with_context(|| format!("could not inspect {}", path.display()))?
+        .permissions();
     AtomicFile::new(path, AllowOverwrite)
-        .write(|file| file.write_all(contents))
+        .write(|file| {
+            file.set_permissions(permissions)?;
+            file.write_all(contents)
+        })
         .map_err(std::io::Error::from)
         .with_context(|| format!("could not replace {}", path.display()))?;
     Ok(())
@@ -685,6 +814,57 @@ mod tests {
     }
 
     #[test]
+    fn updates_cannot_change_card_identity_or_path() {
+        let (_directory, project) = project();
+        let created = project
+            .create_card(CreateCard {
+                title: "Stable identity".to_owned(),
+                ..CreateCard::default()
+            })
+            .unwrap();
+        let before = fs::read(&created.path).unwrap();
+
+        let identity_result = project.update_card(&created.metadata.id, |card| {
+            card.metadata.id = "KB-999".to_owned();
+            Ok(())
+        });
+        assert!(
+            identity_result
+                .unwrap_err()
+                .to_string()
+                .contains("identity")
+        );
+
+        let path_result = project.update_card(&created.metadata.id, |card| {
+            card.path = project.root.join("redirected.md");
+            Ok(())
+        });
+        assert!(path_result.unwrap_err().to_string().contains("path"));
+        assert_eq!(fs::read(&created.path).unwrap(), before);
+        assert!(!project.root.join("redirected.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_updates_preserve_card_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_directory, project) = project();
+        let created = project
+            .create_card(CreateCard {
+                title: "Private card".to_owned(),
+                ..CreateCard::default()
+            })
+            .unwrap();
+        fs::set_permissions(&created.path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        project.move_card(&created.metadata.id, "Done").unwrap();
+
+        let mode = fs::metadata(created.path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
     fn concurrent_creates_allocate_unique_ids() {
         let (_directory, project) = project();
         let project = Arc::new(project);
@@ -743,6 +923,98 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cards_directory_cannot_resolve_outside_internal_directory() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, project) = project();
+        let outside = directory.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::remove_dir(&project.cards_dir).unwrap();
+        symlink(&outside, &project.cards_dir).unwrap();
+
+        let error = Project::open(&project.root).unwrap_err();
+        assert!(error.to_string().contains("resolves outside"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_cards_directory_escape_is_rejected_before_creating_outside() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, project) = project();
+        let outside = directory.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, project.internal_dir.join("link")).unwrap();
+
+        let mut config = project.config.clone();
+        config.cards_dir = "link/new/deep".to_owned();
+        fs::write(
+            &project.config_path,
+            serde_saphyr::to_string(&config).unwrap(),
+        )
+        .unwrap();
+
+        let error = Project::open(&project.root).unwrap_err();
+        assert!(error.to_string().contains("resolves outside"));
+        assert!(!outside.join("new").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_rejects_a_symlinked_internal_directory_before_writing_outside() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("project");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join(INTERNAL_DIR)).unwrap();
+        let config = BoardConfig::new("Demo", "KB", vec!["Todo".to_owned()]);
+
+        let error = Project::init(&root, &config).unwrap_err();
+        assert!(error.to_string().contains("symlinked"));
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_a_symlinked_internal_directory_before_creating_cards() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("project");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let mut config = BoardConfig::new("Demo", "KB", vec!["Todo".to_owned()]);
+        config.cards_dir = "new/deep".to_owned();
+        fs::write(
+            outside.join(CONFIG_FILE),
+            serde_saphyr::to_string(&config).unwrap(),
+        )
+        .unwrap();
+        symlink(&outside, root.join(INTERNAL_DIR)).unwrap();
+
+        let error = Project::open(&root).unwrap_err();
+        assert!(error.to_string().contains("symlinked"));
+        assert!(!outside.join("new").exists());
+    }
+
+    #[test]
+    fn init_preserves_an_existing_internal_gitignore() {
+        let directory = tempdir().unwrap();
+        fs::create_dir(directory.path().join(INTERNAL_DIR)).unwrap();
+        let ignore = directory.path().join(INTERNAL_DIR).join(".gitignore");
+        fs::write(&ignore, "custom-entry\n").unwrap();
+        let config = BoardConfig::new("Demo", "KB", vec!["Todo".to_owned()]);
+
+        Project::init(directory.path(), &config).unwrap();
+        assert_eq!(fs::read_to_string(ignore).unwrap(), "custom-entry\n");
+    }
+
     #[test]
     fn wip_limits_are_enforced() {
         let (_directory, project) = project();
@@ -773,5 +1045,12 @@ mod tests {
                 .status,
             "Doing"
         );
+
+        let path = project.load_card(&second.metadata.id).unwrap().path;
+        let source = fs::read_to_string(&path).unwrap();
+        fs::write(&path, source.replace("status: Todo", "status: Doing")).unwrap();
+        assert!(project.validate().iter().any(|issue| {
+            issue.message.contains("WIP limit") && issue.message.contains("2 cards")
+        }));
     }
 }

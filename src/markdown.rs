@@ -1,10 +1,13 @@
 //! Conservative mutations for user-defined Markdown sections and checklists.
 //!
-//! The parser deliberately recognizes ATX headings and task-list markers only outside fenced
+//! The parser deliberately recognizes CommonMark ATX headings and task-list markers only outside
 //! code blocks. Mutations touch the smallest possible body range and leave unrelated sections
 //! byte-for-byte unchanged.
 
+use std::collections::HashSet;
+
 use anyhow::{Result, bail};
+use pulldown_cmark::{Event, Options, Parser, Tag};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Section {
@@ -40,22 +43,14 @@ struct LineInfo<'a> {
 
 pub fn sections(body: &str) -> Vec<Section> {
     let lines = lines(body);
+    let (commonmark_headings, _) = commonmark_offsets(body);
     let mut headings = Vec::<(String, u8, usize, usize)>::new();
-    let mut fence: Option<(char, usize)> = None;
 
     for line in &lines {
         let trimmed = line.text.trim_start();
-        if let Some((character, length)) = fence {
-            if is_closing_fence(trimmed, character, length) {
-                fence = None;
-            }
-            continue;
-        }
-        if let Some(marker) = fence_marker(trimmed) {
-            fence = Some(marker);
-            continue;
-        }
-        if let Some((level, title)) = atx_heading(trimmed) {
+        if commonmark_headings.contains(&line.start)
+            && let Some((level, title)) = atx_heading(trimmed)
+        {
             headings.push((title.to_owned(), level, line.start, line.end));
         }
     }
@@ -149,26 +144,20 @@ pub fn remove_section(body: &str, title: &str) -> Result<String> {
 
 pub fn checklist_items(body: &str) -> Vec<ChecklistItem> {
     let body_sections = sections(body);
+    let (_, commonmark_tasks) = commonmark_offsets(body);
     let mut counts = vec![0_usize; body_sections.len() + 1];
     let mut items = Vec::new();
-    let mut fence: Option<(char, usize)> = None;
 
     for line in lines(body) {
         let trimmed = line.text.trim_start();
-        if let Some((character, length)) = fence {
-            if is_closing_fence(trimmed, character, length) {
-                fence = None;
-            }
-            continue;
-        }
-        if let Some(marker) = fence_marker(trimmed) {
-            fence = Some(marker);
-            continue;
-        }
         let Some((relative_checkbox_offset, checked, text)) = checkbox(trimmed) else {
             continue;
         };
         let indentation = line.text.len() - trimmed.len();
+        let checkbox_offset = line.start + indentation + relative_checkbox_offset;
+        if !commonmark_tasks.contains(&checkbox_offset) {
+            continue;
+        }
         let containing = body_sections
             .iter()
             .enumerate()
@@ -184,7 +173,7 @@ pub fn checklist_items(body: &str) -> Vec<ChecklistItem> {
             text: text.to_owned(),
             checked,
             line_number: line.number,
-            checkbox_offset: line.start + indentation + relative_checkbox_offset,
+            checkbox_offset,
             line_start: line.start,
             line_end: line.end,
         });
@@ -259,6 +248,29 @@ pub fn toggle_checklist_global(body: &str, global_index: usize) -> Result<String
         bail!("checklist item {global_index} was not found");
     };
     replace_checkbox(body, &item, !item.checked)
+}
+
+pub fn set_checklist_global(body: &str, global_index: usize, checked: bool) -> Result<String> {
+    let Some(item) = checklist_items(body)
+        .into_iter()
+        .find(|item| item.global_index == global_index)
+    else {
+        bail!("checklist item {global_index} was not found");
+    };
+    replace_checkbox(body, &item, checked)
+}
+
+pub fn remove_checklist_global(body: &str, global_index: usize) -> Result<String> {
+    let Some(item) = checklist_items(body)
+        .into_iter()
+        .find(|item| item.global_index == global_index)
+    else {
+        bail!("checklist item {global_index} was not found");
+    };
+    let mut result = String::with_capacity(body.len() - (item.line_end - item.line_start));
+    result.push_str(&body[..item.line_start]);
+    result.push_str(&body[item.line_end..]);
+    Ok(result)
 }
 
 pub fn remove_checklist_item(body: &str, section: &str, index: usize) -> Result<String> {
@@ -364,18 +376,43 @@ fn lines(body: &str) -> Vec<LineInfo<'_>> {
     result
 }
 
-fn fence_marker(line: &str) -> Option<(char, usize)> {
-    let character = line.chars().next()?;
-    if character != '`' && character != '~' {
-        return None;
+fn commonmark_offsets(body: &str) -> (HashSet<usize>, HashSet<usize>) {
+    // pulldown-cmark currently has a reported offset-iterator panic for a few unsupported control
+    // bytes. Treat such documents as opaque instead of risking a crash during a read-only view.
+    if body.bytes().any(|byte| matches!(byte, b'\0' | 0x0b)) {
+        return (HashSet::new(), HashSet::new());
     }
-    let count = line.chars().take_while(|next| *next == character).count();
-    (count >= 3).then_some((character, count))
+
+    let mut headings = HashSet::new();
+    let mut tasks = HashSet::new();
+    let parser = Parser::new_ext(body, Options::ENABLE_TASKLISTS).into_offset_iter();
+    for (event, range) in parser {
+        match event {
+            Event::Start(Tag::Heading { .. }) => {
+                headings.insert(source_line_start(body, range.start));
+            }
+            Event::TaskListMarker(_) => {
+                let line_start = source_line_start(body, range.start);
+                let line_end = body[range.start..]
+                    .find('\n')
+                    .map_or(body.len(), |offset| range.start + offset);
+                let line = &body[line_start..line_end];
+                let trimmed = line.trim_start();
+                if let Some((relative, _, _)) = checkbox(trimmed) {
+                    let indentation = line.len() - trimmed.len();
+                    tasks.insert(line_start + indentation + relative);
+                }
+            }
+            _ => {}
+        }
+    }
+    (headings, tasks)
 }
 
-fn is_closing_fence(line: &str, character: char, minimum_length: usize) -> bool {
-    let count = line.chars().take_while(|next| *next == character).count();
-    count >= minimum_length && line[count..].trim().is_empty()
+fn source_line_start(body: &str, offset: usize) -> usize {
+    body[..offset.min(body.len())]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1)
 }
 
 fn atx_heading(line: &str) -> Option<(u8, &str)> {
@@ -562,6 +599,13 @@ mod tests {
     fn global_toggle_changes_only_one_state_byte() {
         let toggled = toggle_checklist_global(BODY, 2).unwrap();
         assert_eq!(toggled, BODY.replacen("- [x] Second", "- [ ] Second", 1));
+
+        let checked = set_checklist_global(&toggled, 2, true).unwrap();
+        assert_eq!(checked, BODY);
+
+        let removed = remove_checklist_global(BODY, 2).unwrap();
+        assert!(!removed.contains("Second"));
+        assert!(removed.contains("First"));
     }
 
     #[test]
@@ -582,5 +626,34 @@ mod tests {
 
         let toggled = toggle_checklist_global(body, 1).unwrap();
         assert!(toggled.contains("1. [x] ordered"));
+    }
+
+    #[test]
+    fn ignores_indented_code_but_keeps_real_nested_task_lists() {
+        let body = "## Real\n\n    ## code heading\n    - [ ] literal code\n\n- parent\n  - [ ] nested task\n";
+        let found = sections(body);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].title, "Real");
+        let items = checklist_items(body);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "nested task");
+    }
+
+    #[test]
+    fn indented_fence_literal_does_not_hide_later_structure() {
+        let body = "    ```literal indented code\n## Real heading\n\n- [ ] real task\n";
+        let found = sections(body);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].title, "Real heading");
+        let items = checklist_items(body);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "real task");
+    }
+
+    #[test]
+    fn unsupported_control_bytes_are_treated_as_opaque() {
+        let body = "## Before\n\0\n- [ ] unsafe";
+        assert!(sections(body).is_empty());
+        assert!(checklist_items(body).is_empty());
     }
 }

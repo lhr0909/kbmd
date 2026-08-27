@@ -50,7 +50,7 @@ impl BoardConfig {
             .into_iter()
             .enumerate()
             .map(|(index, name)| ColumnConfig {
-                name,
+                name: name.trim().to_owned(),
                 color: Some(default_column_color(index).to_owned()),
                 wip_limit: None,
             })
@@ -62,9 +62,9 @@ impl BoardConfig {
 
         Self {
             version: schema_version(),
-            name: name.into(),
+            name: name.into().trim().to_owned(),
             cards_dir: default_cards_dir(),
-            id_prefix: id_prefix.into().to_ascii_uppercase(),
+            id_prefix: id_prefix.into().trim().to_ascii_uppercase(),
             default_status,
             columns,
         }
@@ -81,6 +81,10 @@ impl BoardConfig {
         if self.name.trim().is_empty() {
             bail!("board name cannot be empty");
         }
+        if self.name != self.name.trim() {
+            bail!("board name cannot start or end with whitespace");
+        }
+        reject_control_characters("board name", &self.name)?;
         if self.columns.is_empty() {
             bail!("at least one column is required");
         }
@@ -91,6 +95,10 @@ impl BoardConfig {
             if name.is_empty() {
                 bail!("column names cannot be empty");
             }
+            if name != column.name {
+                bail!("column names cannot start or end with whitespace");
+            }
+            reject_control_characters("column names", &column.name)?;
             if !names.insert(name.to_lowercase()) {
                 bail!("duplicate column name: {name}");
             }
@@ -107,6 +115,9 @@ impl BoardConfig {
         }
 
         let prefix = self.id_prefix.trim();
+        if prefix != self.id_prefix {
+            bail!("id_prefix cannot start or end with whitespace");
+        }
         if prefix.is_empty()
             || !prefix
                 .chars()
@@ -116,6 +127,7 @@ impl BoardConfig {
         }
 
         let path = Path::new(&self.cards_dir);
+        reject_control_characters("cards_dir", &self.cards_dir)?;
         if path.as_os_str().is_empty()
             || path.is_absolute()
             || path
@@ -141,6 +153,13 @@ impl BoardConfig {
             .iter()
             .position(|column| column.name.eq_ignore_ascii_case(status))
     }
+}
+
+fn reject_control_characters(field: &str, value: &str) -> Result<()> {
+    if value.chars().any(char::is_control) {
+        bail!("{field} cannot contain control characters");
+    }
+    Ok(())
 }
 
 fn default_column_color(index: usize) -> &'static str {
@@ -186,6 +205,61 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("duplicate")
+        );
+    }
+
+    #[test]
+    fn new_config_normalizes_user_supplied_boundaries() {
+        let config = BoardConfig::new(" Demo ", " kb ", vec![" Todo ".to_owned()]);
+        assert_eq!(config.name, "Demo");
+        assert_eq!(config.id_prefix, "KB");
+        assert_eq!(config.columns[0].name, "Todo");
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn config_rejects_padded_values_loaded_from_yaml() {
+        let mut config = BoardConfig::new("Demo", "KB", vec!["Todo".to_owned(), "Done".to_owned()]);
+        config.columns[1].name = " Done ".to_owned();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("whitespace")
+        );
+
+        config.columns[1].name = "Done".to_owned();
+        config.id_prefix = " KB ".to_owned();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("id_prefix")
+        );
+    }
+
+    #[test]
+    fn config_rejects_multiline_display_values() {
+        let mut config = BoardConfig::new("Demo", "KB", vec!["Todo".to_owned()]);
+        config.name = "Demo\nspoofed".to_owned();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("control")
+        );
+
+        config.name = "Demo".to_owned();
+        config.columns[0].name = "Todo\rDone".to_owned();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("control")
         );
     }
 }

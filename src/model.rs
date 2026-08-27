@@ -62,11 +62,29 @@ impl CardMetadata {
         if self.id.trim().is_empty() {
             bail!("card id cannot be empty");
         }
+        if self.id != self.id.trim() {
+            bail!("card id cannot start or end with whitespace");
+        }
+        reject_control_characters("card id", &self.id)?;
         if self.title.trim().is_empty() {
             bail!("card title cannot be empty");
         }
+        reject_control_characters("card title", &self.title)?;
         if self.status.trim().is_empty() {
             bail!("card status cannot be empty");
+        }
+        if self.status != self.status.trim() {
+            bail!("card status cannot start or end with whitespace");
+        }
+        reject_control_characters("card status", &self.status)?;
+        for label in &self.labels {
+            reject_control_characters("card labels", label)?;
+        }
+        for assignee in &self.assignees {
+            reject_control_characters("card assignees", assignee)?;
+        }
+        if let Some(due_date) = &self.due_date {
+            reject_control_characters("card due date", due_date)?;
         }
         Ok(())
     }
@@ -74,6 +92,13 @@ impl CardMetadata {
     pub fn touch(&mut self) {
         self.updated_date = now();
     }
+}
+
+fn reject_control_characters(field: &str, value: &str) -> Result<()> {
+    if value.chars().any(char::is_control) {
+        bail!("{field} cannot contain control characters");
+    }
+    Ok(())
 }
 
 impl Card {
@@ -104,4 +129,51 @@ where
         Some(OneOrMany::One(value)) => vec![value],
         Some(OneOrMany::Many(values)) => values,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn card_identity_and_status_reject_boundary_whitespace() {
+        let mut metadata =
+            CardMetadata::new("KB-1".to_owned(), "Card".to_owned(), "Todo".to_owned(), 1);
+        metadata.id = " KB-1 ".to_owned();
+        assert!(metadata.validate().unwrap_err().to_string().contains("id"));
+
+        metadata.id = "KB-1".to_owned();
+        metadata.status = " Todo ".to_owned();
+        assert!(
+            metadata
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("status")
+        );
+    }
+
+    #[test]
+    fn card_display_fields_reject_control_characters() {
+        let mut metadata =
+            CardMetadata::new("KB-1".to_owned(), "Card".to_owned(), "Todo".to_owned(), 1);
+        metadata.title = "First line\nsecond line".to_owned();
+        assert!(
+            metadata
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("title")
+        );
+
+        metadata.title = "Card".to_owned();
+        metadata.labels = vec!["safe".to_owned(), "unsafe\rlabel".to_owned()];
+        assert!(
+            metadata
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("labels")
+        );
+    }
 }
