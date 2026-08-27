@@ -1,0 +1,40 @@
+[package]
+name = "kbmd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A local-first, Markdown-native kanban CLI and TUI"
+license = "MIT"
+repository = "https://github.com/lhr0909/kbmd"
+keywords = ["kanban", "markdown", "cli", "tui"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0.104"
+atomicwrites = "0.4.4"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4.6.6", features = ["derive", "wrap_help"] }
+crossterm = "0.29.0"
+fs4 = "1.1.0"
+notify = "8.2.0"
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde-saphyr = "1.1.0"
+serde_json = { version = "1.0.149", features = ["preserve_order"] }
+unicode-width = "0.2.2"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+pretty_assertions = "1.4.1"
+tempfile = "3.27.0"
+
+[profile.release]
+strip = true
+lto = "thin"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
