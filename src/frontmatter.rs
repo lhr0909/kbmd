@@ -41,8 +41,13 @@ pub fn parse<T: DeserializeOwned>(input: &str) -> Result<FrontmatterDocument<T>>
         bail!("YAML frontmatter cannot be empty");
     }
     let metadata = serde_saphyr::from_str(yaml).context("invalid YAML frontmatter")?;
-    let body = input[body_start..]
-        .trim_start_matches(['\r', '\n'])
+    // One blank line conventionally separates frontmatter from Markdown. Remove exactly that
+    // separator, preserving every additional byte in the user-owned body.
+    let body_source = &input[body_start..];
+    let body = body_source
+        .strip_prefix("\r\n")
+        .or_else(|| body_source.strip_prefix('\n'))
+        .unwrap_or(body_source)
         .to_owned();
 
     Ok(FrontmatterDocument { metadata, body })
@@ -53,12 +58,10 @@ pub fn serialize<T: Serialize>(metadata: &T, body: &str) -> Result<String> {
         .context("could not serialize YAML frontmatter")?
         .trim_end()
         .to_owned();
-    let body = body.trim_matches(['\r', '\n']);
-
     if body.is_empty() {
         Ok(format!("---\n{yaml}\n---\n"))
     } else {
-        Ok(format!("---\n{yaml}\n---\n\n{body}\n"))
+        Ok(format!("---\n{yaml}\n---\n\n{body}"))
     }
 }
 
@@ -103,6 +106,21 @@ mod tests {
         let second = parse::<TestMetadata>(&rendered).unwrap();
 
         assert_eq!(second, first);
+    }
+
+    #[test]
+    fn round_trip_preserves_body_boundaries_exactly() {
+        let input = "---\ntitle: Demo\n---\n\n\nIntentional leading blank\n\nNo final newline";
+        let first = parse::<TestMetadata>(input).unwrap();
+        assert_eq!(
+            first.body,
+            "\nIntentional leading blank\n\nNo final newline"
+        );
+
+        let rendered = serialize(&first.metadata, &first.body).unwrap();
+        let second = parse::<TestMetadata>(&rendered).unwrap();
+        assert_eq!(second.body, first.body);
+        assert!(!rendered.ends_with('\n'));
     }
 
     #[test]

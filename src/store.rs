@@ -162,7 +162,7 @@ impl Project {
         atomic_write_new(&path, rendered.as_bytes())?;
         Ok(Card {
             metadata,
-            body: input.body.trim_matches(['\r', '\n']).to_owned(),
+            body: input.body,
             path,
         })
     }
@@ -206,7 +206,6 @@ impl Project {
 
         let rendered = frontmatter::serialize(&card.metadata, &card.body)?;
         atomic_replace_if_unchanged(&card.path, original.as_bytes(), rendered.as_bytes())?;
-        card.body = card.body.trim_matches(['\r', '\n']).to_owned();
         Ok(card)
     }
 
@@ -618,6 +617,22 @@ mod tests {
             serde_json::json!({"points": 3})
         );
         assert_eq!(loaded.body, "## Strange section\n\nNever discard this.\n");
+    }
+
+    #[test]
+    fn metadata_updates_preserve_body_boundaries() {
+        let (_directory, project) = project();
+        let body = "\nIntentional leading blank\n\nNo final newline";
+        let created = project
+            .create_card(CreateCard {
+                title: "Exact body".to_owned(),
+                body: body.to_owned(),
+                ..CreateCard::default()
+            })
+            .unwrap();
+
+        project.move_card(&created.metadata.id, "Done").unwrap();
+        assert_eq!(project.load_card(&created.metadata.id).unwrap().body, body);
     }
 
     #[test]
