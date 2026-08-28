@@ -10,6 +10,7 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::comments;
 use crate::config::BoardConfig;
 use crate::markdown;
 use crate::model::Card;
@@ -63,6 +64,9 @@ enum Command {
     /// Read or mutate checklists in any section.
     #[command(alias = "checklist")]
     Check(CheckArgs),
+    /// Add and read flat, append-only comments.
+    #[command(alias = "comments")]
+    Comment(CommentArgs),
     /// Print the board grouped into columns.
     Board(BoardArgs),
     /// Validate config and all card files.
@@ -297,6 +301,44 @@ enum CheckCommand {
 }
 
 #[derive(Debug, Args)]
+struct CommentArgs {
+    #[command(subcommand)]
+    command: CommentCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CommentCommand {
+    /// Append a comment to a card.
+    Add {
+        id: String,
+        /// Comment Markdown. Omit when using `--file`.
+        #[arg(allow_hyphen_values = true, conflicts_with = "file")]
+        text: Option<String>,
+        /// Read comment Markdown from a file, or `-` for stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "text")]
+        file: Option<PathBuf>,
+        /// Attribution name. Falls back to KBMD_AUTHOR, then Git user.name.
+        #[arg(long)]
+        author: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List comments in document order.
+    List {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one comment by its stable ID.
+    Show {
+        id: String,
+        comment_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Args)]
 struct BoardArgs {
     #[arg(long)]
     json: bool,
@@ -350,6 +392,7 @@ pub fn run_with(cli: Cli) -> Result<()> {
         Some(Command::Field(arguments)) => command_field(&cli.project, arguments.command),
         Some(Command::Section(arguments)) => command_section(&cli.project, arguments.command),
         Some(Command::Check(arguments)) => command_check(&cli.project, arguments.command),
+        Some(Command::Comment(arguments)) => command_comment(&cli.project, arguments.command),
         Some(Command::Board(arguments)) => command_board(&cli.project, arguments),
         Some(Command::Validate) => command_validate(&cli.project),
     }
@@ -754,6 +797,79 @@ fn command_check(start: &Path, command: CheckCommand) -> Result<()> {
             mutate_checklist(&project, &id, "global", |body| {
                 markdown::remove_checklist_global(body, index)
             })
+        }
+    }
+}
+
+fn command_comment(start: &Path, command: CommentCommand) -> Result<()> {
+    let project = Project::discover(start)?;
+    match command {
+        CommentCommand::Add {
+            id,
+            text,
+            file,
+            author,
+            json,
+        } => {
+            let text = read_optional_content(text, file)?.unwrap_or_default();
+            let author = comments::resolve_author(author.as_deref(), &project.root)?;
+            let mut added = None;
+            let card = project.update_card(&id, |card| {
+                let (body, comment) = comments::append(&card.body, &author, &text)?;
+                card.body = body;
+                added = Some(comment);
+                Ok(())
+            })?;
+            let comment = added.expect("comment append succeeded without returning a comment");
+            if json {
+                print_json(&comment)
+            } else {
+                println!(
+                    "Added {} by {} to {}",
+                    comment.id, comment.author, card.metadata.id
+                );
+                Ok(())
+            }
+        }
+        CommentCommand::List { id, json } => {
+            let card = project.load_card(&id)?;
+            let comments = comments::parse(&card.body)?;
+            if json {
+                print_json(&comments)
+            } else if comments.is_empty() {
+                println!("No comments.");
+                Ok(())
+            } else {
+                for comment in comments {
+                    println!(
+                        "{} · {} · {}",
+                        comment.id, comment.author, comment.created_at
+                    );
+                    for line in comment.body.lines() {
+                        println!("  {line}");
+                    }
+                }
+                Ok(())
+            }
+        }
+        CommentCommand::Show {
+            id,
+            comment_id,
+            json,
+        } => {
+            let card = project.load_card(&id)?;
+            let comment = comments::find(&card.body, &comment_id)?;
+            if json {
+                print_json(&comment)
+            } else {
+                println!(
+                    "{} · {} · {}",
+                    comment.id, comment.author, comment.created_at
+                );
+                println!();
+                println!("{}", comment.body);
+                Ok(())
+            }
         }
     }
 }

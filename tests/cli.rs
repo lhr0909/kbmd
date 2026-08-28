@@ -426,3 +426,324 @@ fn markdown_and_field_values_may_begin_with_hyphens() {
             .contains("- [ ] - follow-up")
     );
 }
+
+#[test]
+fn flat_comments_support_argument_file_stdin_and_json_workflows() {
+    let directory = initialized();
+    kbmd(directory.path())
+        .args(["add", "Discuss", "--body", "## Notes\n\nKeep this\n"])
+        .assert()
+        .success();
+
+    let first_output = kbmd(directory.path())
+        .args([
+            "comment",
+            "add",
+            "DEMO-1",
+            "First observation",
+            "--author",
+            "Alice",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(first_output.status.success());
+    let first: Value = serde_json::from_slice(&first_output.stdout).unwrap();
+    assert_eq!(first["schema_version"], 1);
+    assert_eq!(first["data"]["version"], 1);
+    assert_eq!(first["data"]["author"], "Alice");
+    assert_eq!(first["data"]["body"], "First observation");
+    assert!(first["data"].get("parent").is_none());
+    assert!(first["data"].get("reply_to").is_none());
+    let first_id = first["data"]["id"].as_str().unwrap().to_owned();
+
+    kbmd(directory.path())
+        .args([
+            "comments", "add", "DEMO-1", "--file", "-", "--author", "Bob",
+        ])
+        .write_stdin("### A heading inside discussion\n\n- [ ] not actionable\n")
+        .assert()
+        .success();
+
+    let comment_file = directory.path().join("third-comment.md");
+    fs::write(&comment_file, "A **file-backed** comment.\n").unwrap();
+    kbmd(directory.path())
+        .arg("comment")
+        .arg("add")
+        .arg("DEMO-1")
+        .arg("--file")
+        .arg(&comment_file)
+        .args(["--author", "Carol"])
+        .assert()
+        .success();
+
+    let list_output = kbmd(directory.path())
+        .args(["comment", "list", "DEMO-1", "--json"])
+        .output()
+        .unwrap();
+    assert!(list_output.status.success());
+    let list: Value = serde_json::from_slice(&list_output.stdout).unwrap();
+    let comments = list["data"].as_array().unwrap();
+    assert_eq!(comments.len(), 3);
+    assert_eq!(comments[0]["id"], first_id);
+    assert_eq!(comments[0]["author"], "Alice");
+    assert_eq!(comments[1]["author"], "Bob");
+    assert_eq!(
+        comments[1]["body"],
+        "### A heading inside discussion\n\n- [ ] not actionable"
+    );
+    assert_eq!(comments[2]["author"], "Carol");
+    assert_eq!(comments[2]["body"], "A **file-backed** comment.");
+
+    let show_output = kbmd(directory.path())
+        .args(["comment", "show", "DEMO-1", &first_id, "--json"])
+        .output()
+        .unwrap();
+    assert!(show_output.status.success());
+    let shown: Value = serde_json::from_slice(&show_output.stdout).unwrap();
+    assert_eq!(shown["data"], comments[0]);
+
+    let checks_output = kbmd(directory.path())
+        .args(["check", "list", "DEMO-1", "--json"])
+        .output()
+        .unwrap();
+    let checks: Value = serde_json::from_slice(&checks_output.stdout).unwrap();
+    assert!(checks["data"].as_array().unwrap().is_empty());
+
+    let sections_output = kbmd(directory.path())
+        .args(["section", "list", "DEMO-1", "--json"])
+        .output()
+        .unwrap();
+    let sections: Value = serde_json::from_slice(&sections_output.stdout).unwrap();
+    assert_eq!(sections["data"].as_array().unwrap().len(), 2);
+    assert!(
+        sections["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|section| { section["title"] != "A heading inside discussion" })
+    );
+
+    let raw = fs::read_to_string(directory.path().join(".kbmd/cards/DEMO-1.md")).unwrap();
+    assert_eq!(raw.matches("<!-- kbmd:comments:v1 -->").count(), 1);
+    assert_eq!(raw.matches("<!-- kbmd:comment:v1").count(), 3);
+}
+
+#[test]
+fn comments_have_no_reply_command_or_thread_fields() {
+    Command::new(assert_cmd::cargo::cargo_bin!("kbmd"))
+        .args(["comment", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("add"))
+        .stdout(predicate::str::contains("list"))
+        .stdout(predicate::str::contains("show"))
+        .stdout(predicate::str::contains("reply").not());
+
+    let directory = initialized();
+    kbmd(directory.path())
+        .args(["add", "Flat"])
+        .assert()
+        .success();
+    kbmd(directory.path())
+        .args(["comment", "reply", "DEMO-1", "anything"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand"));
+}
+
+#[test]
+fn comment_author_resolution_prefers_explicit_then_environment() {
+    let directory = initialized();
+    kbmd(directory.path())
+        .args(["add", "Authors"])
+        .assert()
+        .success();
+
+    let environment = kbmd(directory.path())
+        .env("KBMD_AUTHOR", "Environment Author")
+        .args(["comment", "add", "DEMO-1", "from env", "--json"])
+        .output()
+        .unwrap();
+    assert!(environment.status.success());
+    let environment: Value = serde_json::from_slice(&environment.stdout).unwrap();
+    assert_eq!(environment["data"]["author"], "Environment Author");
+
+    let explicit = kbmd(directory.path())
+        .env("KBMD_AUTHOR", "Environment Author")
+        .args([
+            "comment",
+            "add",
+            "DEMO-1",
+            "explicit wins",
+            "--author",
+            "Explicit Author",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(explicit.status.success());
+    let explicit: Value = serde_json::from_slice(&explicit.stdout).unwrap();
+    assert_eq!(explicit["data"]["author"], "Explicit Author");
+
+    kbmd(directory.path())
+        .env("KBMD_AUTHOR", "bad\nname")
+        .args(["comment", "add", "DEMO-1", "must fail"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid KBMD_AUTHOR"));
+}
+
+#[test]
+fn concurrent_comment_additions_all_survive_with_unique_ids() {
+    let directory = initialized();
+    kbmd(directory.path())
+        .args(["add", "Concurrent discussion"])
+        .assert()
+        .success();
+    let binary = assert_cmd::cargo::cargo_bin!("kbmd");
+    let children = (0..8)
+        .map(|index| {
+            ProcessCommand::new(binary)
+                .arg("--project")
+                .arg(directory.path())
+                .args(["comment", "add", "DEMO-1"])
+                .arg(format!("Concurrent comment {index}"))
+                .args(["--author", "Load test"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "concurrent comment failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let output = kbmd(directory.path())
+        .args(["comment", "list", "DEMO-1", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let comments = json["data"].as_array().unwrap();
+    assert_eq!(comments.len(), 8);
+    let ids = comments
+        .iter()
+        .map(|comment| comment["id"].as_str().unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(ids.len(), 8);
+}
+
+#[test]
+fn generic_markdown_commands_cannot_damage_comments() {
+    let directory = initialized();
+    kbmd(directory.path())
+        .args([
+            "add",
+            "Protected",
+            "--body",
+            "# Project\n\n- [ ] real task\n\n## Comments\n\nLegacy context\n",
+        ])
+        .assert()
+        .success();
+    kbmd(directory.path())
+        .args([
+            "comment",
+            "add",
+            "DEMO-1",
+            "- [ ] discussion only",
+            "--author",
+            "Alice",
+        ])
+        .assert()
+        .success();
+
+    kbmd(directory.path())
+        .args(["check", "toggle", "DEMO-1", "Project", "1"])
+        .assert()
+        .success();
+    kbmd(directory.path())
+        .args(["check", "toggle-global", "DEMO-1", "1"])
+        .assert()
+        .success();
+    kbmd(directory.path())
+        .args(["check", "add", "DEMO-1", "Project", "second task"])
+        .assert()
+        .success();
+
+    let path = directory.path().join(".kbmd/cards/DEMO-1.md");
+    let before = fs::read(&path).unwrap();
+    for arguments in [
+        vec!["section", "set", "DEMO-1", "Project", "replacement"],
+        vec!["section", "remove", "DEMO-1", "Comments"],
+        vec!["check", "add", "DEMO-1", "Comments", "unsafe"],
+        vec![
+            "section",
+            "set",
+            "DEMO-1",
+            "Notes",
+            "<!-- kbmd:comments:v1 -->",
+        ],
+    ] {
+        kbmd(directory.path()).args(arguments).assert().failure();
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    let output = kbmd(directory.path())
+        .args(["check", "list", "DEMO-1", "--json"])
+        .output()
+        .unwrap();
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let checks = json["data"].as_array().unwrap();
+    assert_eq!(checks.len(), 2);
+    assert!(checks.iter().all(|item| item["text"] != "discussion only"));
+}
+
+#[test]
+fn malformed_requested_comments_are_reported_by_path() {
+    let directory = initialized();
+    kbmd(directory.path())
+        .args(["add", "Broken discussion"])
+        .assert()
+        .success();
+    kbmd(directory.path())
+        .args([
+            "comment",
+            "add",
+            "DEMO-1",
+            "Will be malformed",
+            "--author",
+            "Alice",
+        ])
+        .assert()
+        .success();
+
+    let path = directory.path().join(".kbmd/cards/DEMO-1.md");
+    let source = fs::read_to_string(&path).unwrap();
+    let malformed = source
+        .lines()
+        .filter(|line| !line.starts_with("<!-- kbmd:comment:end "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, malformed).unwrap();
+
+    kbmd(directory.path())
+        .args(["comment", "list", "DEMO-1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("DEMO-1.md"))
+        .stderr(predicate::str::contains("no matching end marker"));
+    kbmd(directory.path())
+        .args(["validate"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("DEMO-1.md"))
+        .stderr(predicate::str::contains("no matching end marker"));
+}
