@@ -7,8 +7,8 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::markdown;
 use crate::model::Card;
+use crate::{comments, markdown};
 
 use super::app::{App, Focus, Mode};
 
@@ -99,6 +99,11 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &App) -> HitMap {
 
     match &app.mode {
         Mode::QuickAdd { title } => render_quick_add(frame, app, title),
+        Mode::AddComment {
+            card_id,
+            author,
+            text,
+        } => render_add_comment(frame, card_id, author, text),
         Mode::Help => render_help(frame),
         Mode::Normal => {}
     }
@@ -307,7 +312,13 @@ fn render_card(frame: &mut Frame<'_>, app: &App, card: &Card, area: Rect) {
     } else {
         format!("  ✓ {checked}/{total}")
     };
-    let details = format!("{}{}", card.metadata.id, progress);
+    let comment_count = comments::parse(&card.body).map_or(0, |comments| comments.len());
+    let comment_badge = if comment_count == 0 {
+        String::new()
+    } else {
+        format!(" · {comment_count} comments")
+    };
+    let details = format!("{}{}{}", card.metadata.id, progress, comment_badge);
     let paragraph = Paragraph::new(vec![
         Line::styled(
             truncate(&card.metadata.title, inner_width),
@@ -458,7 +469,20 @@ fn detail_lines(card: &Card) -> Vec<DetailLine> {
         .into_iter()
         .map(|item| (item.line_number, item.global_index))
         .collect::<HashMap<_, _>>();
-    result.extend(card.body.lines().enumerate().map(|(index, line)| {
+    let hidden = comments::hidden_ranges(&card.body).unwrap_or_default();
+    let mut offset = 0;
+    for (index, source_line) in card.body.split_inclusive('\n').enumerate() {
+        let line_start = offset;
+        let line_end = offset + source_line.len();
+        offset = line_end;
+        if hidden
+            .iter()
+            .any(|range| range.start < line_end && range.end > line_start)
+        {
+            continue;
+        }
+        let line = source_line.strip_suffix('\n').unwrap_or(source_line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
         let checklist = checklists.get(&(index + 1)).copied();
         let style = if checklist.is_some() {
             Style::default().fg(Color::White)
@@ -469,12 +493,12 @@ fn detail_lines(card: &Card) -> Vec<DetailLine> {
         } else {
             Style::default().fg(Color::Gray)
         };
-        DetailLine {
+        result.push(DetailLine {
             text: line.to_owned(),
             style,
             checklist,
-        }
-    }));
+        });
+    }
     result
 }
 
@@ -506,10 +530,10 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let help = match app.focus {
         Focus::Board => {
-            " ←/→ or h/l columns · ↑/↓ or j/k cards · [/] move · n add · r reload · Tab detail · ? help · q quit"
+            " ←/→ or h/l columns · ↑/↓ or j/k cards · [/] move · n add · c comment · r reload · Tab detail · ? help · q quit"
         }
         Focus::Detail => {
-            " ↑/↓ or j/k checklist · Space toggle · wheel scroll · r reload · Tab board · ? help · q quit"
+            " ↑/↓ or j/k checklist · Space toggle · c comment · r reload · Tab board · ? help · q quit"
         }
     };
     frame.render_widget(
@@ -554,8 +578,46 @@ fn render_quick_add(frame: &mut Frame<'_>, app: &App, title: &str) {
     frame.set_cursor_position((cursor, input.y));
 }
 
+fn render_add_comment(frame: &mut Frame<'_>, card_id: &str, author: &str, text: &str) {
+    let area = centered_rect(frame.area(), 68, 7);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(format!(" Comment on {card_id} "));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [attribution, input, hint, _] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(truncate(
+            &format!("Posting as {author}"),
+            attribution.width as usize,
+        ))
+        .style(Style::default().fg(Color::Cyan)),
+        attribution,
+    );
+    let shown = input_tail(text, input.width.saturating_sub(1) as usize);
+    frame.render_widget(Paragraph::new(shown.clone()), input);
+    frame.render_widget(
+        Paragraph::new("Enter post · Esc cancel · Ctrl-U clear")
+            .style(Style::default().fg(Color::DarkGray)),
+        hint,
+    );
+    let cursor = input
+        .x
+        .saturating_add(UnicodeWidthStr::width(shown.as_str()) as u16)
+        .min(input.right().saturating_sub(1));
+    frame.set_cursor_position((cursor, input.y));
+}
+
 fn render_help(frame: &mut Frame<'_>) {
-    let area = centered_rect(frame.area(), 68, 20);
+    let area = centered_rect(frame.area(), 68, 21);
     frame.render_widget(Clear, area);
     let text = [
         "Keyboard",
@@ -565,6 +627,7 @@ fn render_help(frame: &mut Frame<'_>) {
         "  Tab             switch board/detail focus",
         "  Space           toggle selected checklist item",
         "  n               quick-add a card",
+        "  c               add a flat comment",
         "  r               reload files now",
         "  ?               close this help",
         "  q               quit",
@@ -658,12 +721,38 @@ fn truncate(value: &str, width: usize) -> String {
     result
 }
 
+fn input_tail(value: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= width {
+        return value.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_owned();
+    }
+    let available = width - 1;
+    let mut suffix = Vec::new();
+    let mut used = 0;
+    for character in value.chars().rev() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width > available {
+            break;
+        }
+        suffix.push(character);
+        used += character_width;
+    }
+    suffix.reverse();
+    format!("…{}", suffix.into_iter().collect::<String>())
+}
+
 #[cfg(test)]
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use tempfile::tempdir;
 
+    use crate::comments;
     use crate::config::BoardConfig;
     use crate::store::{CreateCard, Project};
 
@@ -738,11 +827,124 @@ mod tests {
                 ..
             }
         )));
+        assert!(!rendered.contains("0 comments"));
+    }
+
+    #[test]
+    fn detail_hides_only_managed_comment_records_and_keeps_source_targets_aligned() {
+        let (_directory, mut app) = app();
+        app.project
+            .update_card("KB-1", |card| {
+                let body = "## Comments\n\nExisting context.\n\n## Bespoke plan\n\n- [ ] Flexible item\n";
+                let (body, _) = comments::append(
+                    body,
+                    "TUI Author",
+                    "Visible note\n\n- [ ] comment task\n\n```html\n<!-- kbmd:comment:example -->\n```",
+                )?;
+                card.body = body;
+                Ok(())
+            })
+            .unwrap();
+        app.cards = app.project.load_cards().unwrap();
+        app.focus = Focus::Detail;
+        let card = app.selected_card().unwrap();
+
+        let lines = detail_lines(card);
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.text == comments::COMMENTS_MARKER)
+        );
+        assert!(!lines.iter().any(|line| line.text == "<!-- kbmd:comment:v1"));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.text.starts_with("<!-- kbmd:comment:end "))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text.starts_with("Comment by **TUI Author** · "))
+        );
+        assert!(lines.iter().any(|line| line.text == "Visible note"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text == "<!-- kbmd:comment:example -->")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text == "- [ ] comment task" && line.checklist.is_none())
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text == "- [ ] Flexible item" && line.checklist == Some(1))
+        );
+
+        let backend = TestBackend::new(140, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut hit_map = HitMap::default();
+        terminal
+            .draw(|frame| hit_map = render(frame, &app))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("· 1 comments"));
+        assert_eq!(
+            hit_map
+                .regions
+                .iter()
+                .filter(|region| matches!(region.target, HitTarget::Checklist { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn comment_composer_renders_attribution_instructions_draft_and_cursor() {
+        let (_directory, mut app) = app();
+        app.mode = Mode::AddComment {
+            card_id: "KB-1".to_owned(),
+            author: "TUI Author".to_owned(),
+            text: "draft text".to_owned(),
+        };
+        let backend = TestBackend::new(90, 26);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| _ = render(frame, &app)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Comment on KB-1"));
+        assert!(rendered.contains("Posting as TUI Author"));
+        assert!(rendered.contains("draft text"));
+        assert!(rendered.contains("Enter post · Esc cancel · Ctrl-U clear"));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .area
+                .contains(terminal.get_cursor_position().unwrap())
+        );
     }
 
     #[test]
     fn truncate_respects_wide_characters() {
         assert_eq!(truncate("ab界cd", 5), "ab界…");
         assert_eq!(UnicodeWidthStr::width(truncate("ab界cd", 5).as_str()), 5);
+        assert_eq!(input_tail("ab界cd", 5), "…界cd");
+        assert_eq!(UnicodeWidthStr::width(input_tail("ab界cd", 5).as_str()), 5);
     }
 }
