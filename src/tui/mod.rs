@@ -386,7 +386,12 @@ mod tests {
             ),
             vec![Effect::Quit]
         );
+        app.drag = Some(app::DragState {
+            card_id: "K-1".to_owned(),
+            hover_column: 0,
+        });
         assert!(handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).is_empty());
         assert_eq!(app.mode, Mode::Normal);
+        assert!(app.drag.is_none());
     }
 }

@@ -165,11 +165,13 @@ impl App {
                 self.mode = if self.mode == Mode::Help {
                     Mode::Normal
                 } else {
+                    self.drag = None;
                     Mode::Help
                 };
                 Vec::new()
             }
             Action::OpenQuickAdd => {
+                self.drag = None;
                 self.mode = Mode::QuickAdd {
                     title: String::new(),
                 };
@@ -177,10 +179,12 @@ impl App {
                 Vec::new()
             }
             Action::OpenComment => {
+                self.drag = None;
                 self.open_comment();
                 Vec::new()
             }
             Action::CancelModal => {
+                self.drag = None;
                 self.mode = Mode::Normal;
                 self.error = None;
                 Vec::new()
@@ -815,8 +819,13 @@ mod tests {
         let (_directory, mut app) = app();
         configure_git_author(&app);
         let expected_author = comments::resolve_author(None, &app.project.root).unwrap();
+        app.drag = Some(DragState {
+            card_id: "T-1".to_owned(),
+            hover_column: 0,
+        });
 
         assert!(app.reduce(Action::OpenComment).is_empty());
+        assert!(app.drag.is_none());
         for character in "Looks good".chars() {
             app.reduce(Action::CommentCharacter(character));
         }
