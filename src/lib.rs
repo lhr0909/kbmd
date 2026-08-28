@@ -1,6 +1,7 @@
 //! Core library for `kbmd`, a Markdown-native kanban.
 
 pub mod cli;
+pub mod comments;
 pub mod config;
 pub mod frontmatter;
 pub mod markdown;

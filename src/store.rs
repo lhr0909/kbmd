@@ -11,6 +11,7 @@ use fs4::FileExt;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::comments;
 use crate::config::BoardConfig;
 use crate::frontmatter;
 use crate::model::{Card, CardMetadata};
@@ -128,18 +129,55 @@ impl Project {
 
     pub fn load_card(&self, id: &str) -> Result<Card> {
         // Read-only lookup remains useful when an unrelated hand-edited card is temporarily
-        // malformed. Mutations still load and validate the entire collection before writing.
-        let cards = card_paths(&self.cards_dir)?
-            .into_iter()
-            .filter_map(|path| load_card_path(&path).ok())
-            .collect();
-        find_unique_card(cards, id)
+        // malformed. Keep errors for malformed files that still identify themselves as the
+        // requested card, so a broken target is not misleadingly reported as missing.
+        let id = id.trim();
+        let mut candidates = Vec::new();
+        for path in card_paths(&self.cards_dir)? {
+            let source = match fs::read_to_string(&path)
+                .with_context(|| format!("could not read card {}", path.display()))
+            {
+                Ok(source) => source,
+                Err(error) => {
+                    if card_filename_matches_id(&path, id) {
+                        candidates.push(Err(error));
+                    }
+                    continue;
+                }
+            };
+            match parse_card_source(&path, &source) {
+                Ok(card) if card.metadata.id.eq_ignore_ascii_case(id) => {
+                    candidates.push(Ok(card));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    // A card can have valid identifying frontmatter while its body (including
+                    // structured comments) is malformed. Parse only enough to associate that
+                    // error with this lookup. Fall back to the already-enumerated filename only
+                    // when the frontmatter cannot identify the card at all.
+                    let matches_target = match frontmatter::parse::<CardMetadata>(&source) {
+                        Ok(document) => document.metadata.id.trim().eq_ignore_ascii_case(id),
+                        Err(_) => card_filename_matches_id(&path, id),
+                    };
+                    if matches_target {
+                        candidates.push(Err(error));
+                    }
+                }
+            }
+        }
+
+        match candidates.len() {
+            0 => bail!("card {:?} was not found", id),
+            1 => candidates.into_iter().next().expect("length checked"),
+            count => bail!("card id {:?} is ambiguous across {count} files", id),
+        }
     }
 
     pub fn create_card(&self, input: CreateCard) -> Result<Card> {
         if input.title.trim().is_empty() {
             bail!("card title cannot be empty");
         }
+        comments::validate(&input.body).context("invalid structured comments")?;
         let _lock = self.lock()?;
         // Refresh inside the lock so status and ID allocation use the latest config and files.
         let project = Self::open(&self.root)?;
@@ -221,6 +259,7 @@ impl Project {
         if card.path != stable_path {
             bail!("card path cannot be changed through an update");
         }
+        comments::validate(&card.body).context("invalid structured comments")?;
         card.metadata.title = card.metadata.title.trim().to_owned();
         card.metadata.validate()?;
         reject_reserved_extra_keys(&card.metadata.extra)?;
@@ -481,6 +520,14 @@ fn load_card_path(path: &Path) -> Result<Card> {
     parse_card_source(path, &source)
 }
 
+fn card_filename_matches_id(path: &Path, id: &str) -> bool {
+    // Compare only against paths already enumerated inside `cards_dir`; never interpolate a
+    // caller-controlled ID into a filesystem path.
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case(id))
+}
+
 fn parse_card_source(path: &Path, source: &str) -> Result<Card> {
     let document = frontmatter::parse::<CardMetadata>(source)
         .with_context(|| format!("could not parse card {}", path.display()))?;
@@ -489,6 +536,8 @@ fn parse_card_source(path: &Path, source: &str) -> Result<Card> {
         .validate()
         .with_context(|| format!("invalid card {}", path.display()))?;
     reject_reserved_extra_keys(&document.metadata.extra)?;
+    comments::validate(&document.body)
+        .with_context(|| format!("invalid structured comments in {}", path.display()))?;
     Ok(Card {
         metadata: document.metadata,
         body: document.body,
@@ -788,6 +837,85 @@ mod tests {
     }
 
     #[test]
+    fn load_card_ignores_an_unrelated_malformed_card() {
+        let (_directory, project) = project();
+        let created = project
+            .create_card(CreateCard {
+                title: "Readable target".to_owned(),
+                ..CreateCard::default()
+            })
+            .unwrap();
+        fs::write(project.cards_dir.join("broken.md"), "not frontmatter").unwrap();
+
+        let loaded = project.load_card(&created.metadata.id).unwrap();
+        assert_eq!(loaded.metadata.title, "Readable target");
+    }
+
+    #[test]
+    fn load_card_surfaces_a_malformed_target_identified_by_frontmatter() {
+        let (_directory, project) = project();
+        let created = project
+            .create_card(CreateCard {
+                title: "Broken comments".to_owned(),
+                ..CreateCard::default()
+            })
+            .unwrap();
+        let renamed_path = project.cards_dir.join("renamed-card.md");
+        fs::rename(&created.path, &renamed_path).unwrap();
+        let source = fs::read_to_string(&renamed_path).unwrap();
+        fs::write(
+            &renamed_path,
+            format!("{source}\n<!-- kbmd:comment:v2 -->\n"),
+        )
+        .unwrap();
+
+        let error = project.load_card(&created.metadata.id).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("invalid structured comments"));
+        assert!(message.contains("malformed or unsupported"));
+        assert!(!message.contains("was not found"));
+    }
+
+    #[test]
+    fn load_card_surfaces_an_unparseable_canonical_target() {
+        let (_directory, project) = project();
+        let created = project
+            .create_card(CreateCard {
+                title: "Broken target".to_owned(),
+                ..CreateCard::default()
+            })
+            .unwrap();
+        fs::write(&created.path, "not frontmatter").unwrap();
+
+        let error = project.load_card(&created.metadata.id).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("could not parse card"));
+        assert!(message.contains("frontmatter"));
+        assert!(!message.contains("was not found"));
+    }
+
+    #[test]
+    fn malformed_target_candidates_preserve_ambiguous_id_detection() {
+        let (_directory, project) = project();
+        let created = project
+            .create_card(CreateCard {
+                title: "Ambiguous target".to_owned(),
+                ..CreateCard::default()
+            })
+            .unwrap();
+        fs::copy(&created.path, project.cards_dir.join("duplicate.md")).unwrap();
+        let source = fs::read_to_string(&created.path).unwrap();
+        fs::write(
+            &created.path,
+            format!("{source}\n<!-- kbmd:comment:v2 -->\n"),
+        )
+        .unwrap();
+
+        let error = project.load_card(&created.metadata.id).unwrap_err();
+        assert!(error.to_string().contains("ambiguous across 2 files"));
+    }
+
+    #[test]
     fn an_external_write_during_mutation_is_never_overwritten() {
         let (_directory, project) = project();
         let created = project
@@ -842,6 +970,32 @@ mod tests {
         assert!(path_result.unwrap_err().to_string().contains("path"));
         assert_eq!(fs::read(&created.path).unwrap(), before);
         assert!(!project.root.join("redirected.md").exists());
+    }
+
+    #[test]
+    fn updates_reject_invalid_structured_comments_without_writing() {
+        let (_directory, project) = project();
+        let created = project
+            .create_card(CreateCard {
+                title: "Stable comments".to_owned(),
+                body: "## Notes\n\nPreserve me.\n".to_owned(),
+                ..CreateCard::default()
+            })
+            .unwrap();
+        let before = fs::read(&created.path).unwrap();
+
+        let result = project.update_card(&created.metadata.id, |card| {
+            card.body.push_str("\n<!-- kbmd:comment:v2 -->\n");
+            Ok(())
+        });
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid structured comments")
+        );
+        assert_eq!(fs::read(&created.path).unwrap(), before);
     }
 
     #[cfg(unix)]
