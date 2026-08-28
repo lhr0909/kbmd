@@ -89,12 +89,32 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
 
     match app.mode.clone() {
         Mode::QuickAdd { .. } => handle_quick_add_key(app, key),
+        Mode::AddComment { .. } => handle_comment_key(app, key),
         Mode::Help => match key.code {
             KeyCode::Char('q') => app.reduce(Action::Quit),
             KeyCode::Esc | KeyCode::Char('?') => app.reduce(Action::ToggleHelp),
             _ => Vec::new(),
         },
         Mode::Normal => handle_normal_key(app, key),
+    }
+}
+
+fn handle_comment_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
+    match key.code {
+        KeyCode::Esc => app.reduce(Action::CancelModal),
+        KeyCode::Enter => app.reduce(Action::SubmitComment),
+        KeyCode::Backspace => app.reduce(Action::CommentBackspace),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.reduce(Action::CommentClear)
+        }
+        KeyCode::Char(character)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            app.reduce(Action::CommentCharacter(character))
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -123,6 +143,7 @@ fn handle_normal_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Char('r') => app.reduce(Action::Reload),
         KeyCode::Char('?') => app.reduce(Action::ToggleHelp),
         KeyCode::Char('n') => app.reduce(Action::OpenQuickAdd),
+        KeyCode::Char('c') => app.reduce(Action::OpenComment),
         KeyCode::Tab | KeyCode::BackTab => app.reduce(Action::ToggleFocus),
         KeyCode::Char('[') => app.reduce(Action::MoveSelected(-1)),
         KeyCode::Char(']') => app.reduce(Action::MoveSelected(1)),
@@ -261,7 +282,7 @@ mod tests {
         hit_map.push(
             Rect::new(0, 0, 5, 1),
             HitTarget::Checklist {
-                card_id: card.metadata.id,
+                card_id: card.metadata.id.clone(),
                 global_index: 1,
             },
         );
@@ -276,8 +297,96 @@ mod tests {
             title: String::new(),
         };
         assert!(handle_mouse(&mut app, click, &hit_map).is_empty());
+        app.mode = Mode::AddComment {
+            card_id: card.metadata.id.clone(),
+            author: "Mouse Author".to_owned(),
+            text: "draft".to_owned(),
+        };
+        assert!(handle_mouse(&mut app, click, &hit_map).is_empty());
         app.mode = Mode::Help;
         assert!(handle_mouse(&mut app, click, &hit_map).is_empty());
         assert!(app.drag.is_none());
+    }
+
+    #[test]
+    fn comment_composer_keys_type_command_letters_and_control_the_draft() {
+        let directory = tempdir().unwrap();
+        let project = Project::init(
+            directory.path(),
+            &BoardConfig::new("Key test", "K", vec!["Todo".to_owned()]),
+        )
+        .unwrap();
+        let card = project
+            .create_card(CreateCard {
+                title: "Card".to_owned(),
+                ..CreateCard::default()
+            })
+            .unwrap();
+        let mut app = App::new(project, vec![card]);
+        app.mode = Mode::AddComment {
+            card_id: "K-1".to_owned(),
+            author: "Key Author".to_owned(),
+            text: String::new(),
+        };
+
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)
+            )
+            .is_empty()
+        );
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)
+            )
+            .is_empty()
+        );
+        assert!(matches!(
+            app.mode,
+            Mode::AddComment { ref text, .. } if text == "cr"
+        ));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        assert!(matches!(
+            app.mode,
+            Mode::AddComment { ref text, .. } if text == "c"
+        ));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(
+            app.mode,
+            Mode::AddComment { ref text, .. } if text.is_empty()
+        ));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        assert_eq!(
+            handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            vec![Effect::AddComment {
+                id: "K-1".to_owned(),
+                author: "Key Author".to_owned(),
+                text: "x".to_owned(),
+            }]
+        );
+        assert!(matches!(app.mode, Mode::AddComment { .. }));
+
+        assert_eq!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ),
+            vec![Effect::Quit]
+        );
+        assert!(handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).is_empty());
+        assert_eq!(app.mode, Mode::Normal);
     }
 }

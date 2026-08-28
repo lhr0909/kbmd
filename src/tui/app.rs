@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 
-use crate::markdown;
 use crate::model::Card;
 use crate::store::{CreateCard, Project};
+use crate::{comments, markdown};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Focus {
@@ -17,6 +17,11 @@ pub(crate) enum Mode {
     Normal,
     QuickAdd {
         title: String,
+    },
+    AddComment {
+        card_id: String,
+        author: String,
+        text: String,
     },
     Help,
 }
@@ -33,11 +38,16 @@ pub(crate) enum Action {
     Reload,
     ToggleHelp,
     OpenQuickAdd,
+    OpenComment,
     CancelModal,
     QuickAddCharacter(char),
     QuickAddBackspace,
     QuickAddClear,
     SubmitQuickAdd,
+    CommentCharacter(char),
+    CommentBackspace,
+    CommentClear,
+    SubmitComment,
     Focus(Focus),
     ToggleFocus,
     PreviousColumn,
@@ -67,9 +77,23 @@ pub(crate) enum Action {
 pub(crate) enum Effect {
     Quit,
     Reload,
-    CreateCard { title: String, status: String },
-    MoveCard { id: String, status: String },
-    ToggleChecklist { id: String, global_index: usize },
+    CreateCard {
+        title: String,
+        status: String,
+    },
+    AddComment {
+        id: String,
+        author: String,
+        text: String,
+    },
+    MoveCard {
+        id: String,
+        status: String,
+    },
+    ToggleChecklist {
+        id: String,
+        global_index: usize,
+    },
 }
 
 pub(crate) struct App {
@@ -152,8 +176,13 @@ impl App {
                 self.error = None;
                 Vec::new()
             }
+            Action::OpenComment => {
+                self.open_comment();
+                Vec::new()
+            }
             Action::CancelModal => {
                 self.mode = Mode::Normal;
+                self.error = None;
                 Vec::new()
             }
             Action::QuickAddCharacter(character) => {
@@ -175,6 +204,28 @@ impl App {
                 Vec::new()
             }
             Action::SubmitQuickAdd => self.submit_quick_add(),
+            Action::CommentCharacter(character) => {
+                if let Mode::AddComment { text, .. } = &mut self.mode {
+                    text.push(character);
+                    self.error = None;
+                }
+                Vec::new()
+            }
+            Action::CommentBackspace => {
+                if let Mode::AddComment { text, .. } = &mut self.mode {
+                    text.pop();
+                    self.error = None;
+                }
+                Vec::new()
+            }
+            Action::CommentClear => {
+                if let Mode::AddComment { text, .. } = &mut self.mode {
+                    text.clear();
+                    self.error = None;
+                }
+                Vec::new()
+            }
+            Action::SubmitComment => self.submit_comment(),
             Action::Focus(focus) => {
                 self.focus = focus;
                 Vec::new()
@@ -303,6 +354,25 @@ impl App {
                     Err(error) => self.error = Some(format!("Could not create card: {error:#}")),
                 }
             }
+            Effect::AddComment { id, author, text } => {
+                let update = self.project.update_card(&id, |card| {
+                    let (body, _) = comments::append(&card.body, &author, &text)?;
+                    card.body = body;
+                    Ok(())
+                });
+                match update {
+                    Ok(_) => {
+                        self.reload_preserving(Some(&id));
+                        self.mode = Mode::Normal;
+                        if self.error.is_none() {
+                            self.message = Some(format!("Commented on {id}"));
+                        }
+                    }
+                    Err(error) => {
+                        self.error = Some(format!("Could not comment on {id}: {error:#}"));
+                    }
+                }
+            }
             Effect::MoveCard { id, status } => match self.project.move_card(&id, &status) {
                 Ok(_) => {
                     self.reload_preserving(Some(&id));
@@ -356,6 +426,47 @@ impl App {
         self.mode = Mode::Normal;
         self.error = None;
         vec![Effect::CreateCard { title, status }]
+    }
+
+    fn open_comment(&mut self) {
+        let Some(card_id) = self.selected_card().map(|card| card.metadata.id.clone()) else {
+            self.error = Some("Select a card before adding a comment".to_owned());
+            return;
+        };
+        match comments::resolve_author(None, &self.project.root) {
+            Ok(author) => {
+                self.mode = Mode::AddComment {
+                    card_id,
+                    author,
+                    text: String::new(),
+                };
+                self.error = None;
+            }
+            Err(error) => {
+                self.error = Some(format!("Could not resolve comment author: {error:#}"));
+            }
+        }
+    }
+
+    fn submit_comment(&mut self) -> Vec<Effect> {
+        let Mode::AddComment {
+            card_id,
+            author,
+            text,
+        } = &self.mode
+        else {
+            return Vec::new();
+        };
+        if text.trim().is_empty() {
+            self.error = Some("Comment text cannot be empty".to_owned());
+            return Vec::new();
+        }
+        self.error = None;
+        vec![Effect::AddComment {
+            id: card_id.clone(),
+            author: author.clone(),
+            text: text.clone(),
+        }]
     }
 
     fn move_selected(&self, delta: i32) -> Vec<Effect> {
@@ -586,8 +697,11 @@ fn offset_index(index: usize, delta: i32, maximum: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use tempfile::tempdir;
 
+    use crate::comments;
     use crate::config::BoardConfig;
 
     use super::*;
@@ -618,6 +732,22 @@ mod tests {
             .unwrap();
         let cards = project.load_cards().unwrap();
         (directory, App::new(project, cards))
+    }
+
+    fn configure_git_author(app: &App) {
+        let initialized = Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&app.project.root)
+            .status()
+            .unwrap();
+        assert!(initialized.success());
+        let configured = Command::new("git")
+            .arg("-C")
+            .arg(&app.project.root)
+            .args(["config", "user.name", "TUI Author"])
+            .status()
+            .unwrap();
+        assert!(configured.success());
     }
 
     #[test]
@@ -678,6 +808,130 @@ mod tests {
             }]
         );
         assert!(app.drag.is_none());
+    }
+
+    #[test]
+    fn reducer_captures_comment_target_author_and_draft_until_persisted() {
+        let (_directory, mut app) = app();
+        configure_git_author(&app);
+        let expected_author = comments::resolve_author(None, &app.project.root).unwrap();
+
+        assert!(app.reduce(Action::OpenComment).is_empty());
+        for character in "Looks good".chars() {
+            app.reduce(Action::CommentCharacter(character));
+        }
+        let expected_mode = Mode::AddComment {
+            card_id: "T-1".to_owned(),
+            author: expected_author.clone(),
+            text: "Looks good".to_owned(),
+        };
+        assert_eq!(app.mode, expected_mode);
+
+        let effects = app.reduce(Action::SubmitComment);
+
+        assert_eq!(
+            effects,
+            vec![Effect::AddComment {
+                id: "T-1".to_owned(),
+                author: expected_author,
+                text: "Looks good".to_owned(),
+            }]
+        );
+        assert_eq!(app.mode, expected_mode);
+    }
+
+    #[test]
+    fn comment_draft_survives_reload_and_selection_changes_without_retargeting() {
+        let (_directory, mut app) = app();
+        app.mode = Mode::AddComment {
+            card_id: "T-1".to_owned(),
+            author: "TUI Author".to_owned(),
+            text: "Still writing".to_owned(),
+        };
+        app.selected_id = Some("T-2".to_owned());
+        app.selected_row = 1;
+
+        app.reload();
+
+        assert_eq!(app.selected_id.as_deref(), Some("T-2"));
+        assert_eq!(
+            app.mode,
+            Mode::AddComment {
+                card_id: "T-1".to_owned(),
+                author: "TUI Author".to_owned(),
+                text: "Still writing".to_owned(),
+            }
+        );
+        assert!(matches!(
+            app.reduce(Action::SubmitComment).as_slice(),
+            [Effect::AddComment { id, .. }] if id == "T-1"
+        ));
+    }
+
+    #[test]
+    fn empty_comment_and_failed_write_retain_the_modal_and_draft() {
+        let (_directory, mut app) = app();
+        app.mode = Mode::AddComment {
+            card_id: "T-404".to_owned(),
+            author: "TUI Author".to_owned(),
+            text: "   ".to_owned(),
+        };
+
+        assert!(app.reduce(Action::SubmitComment).is_empty());
+        assert_eq!(app.error.as_deref(), Some("Comment text cannot be empty"));
+        assert!(matches!(app.mode, Mode::AddComment { .. }));
+
+        app.reduce(Action::CommentClear);
+        for character in "Keep this draft".chars() {
+            app.reduce(Action::CommentCharacter(character));
+        }
+        let effect = app.reduce(Action::SubmitComment).pop().unwrap();
+        app.apply_effect(effect).unwrap();
+
+        assert!(
+            app.error
+                .as_deref()
+                .unwrap()
+                .contains("Could not comment on T-404")
+        );
+        assert_eq!(
+            app.mode,
+            Mode::AddComment {
+                card_id: "T-404".to_owned(),
+                author: "TUI Author".to_owned(),
+                text: "Keep this draft".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn comment_effect_persists_then_closes_without_resetting_detail_position() {
+        let (_directory, mut app) = app();
+        app.detail_checklist = 1;
+        app.detail_scroll = 4;
+        app.detail_follow_cursor = false;
+        app.mode = Mode::AddComment {
+            card_id: "T-1".to_owned(),
+            author: "TUI Author".to_owned(),
+            text: "Persist me".to_owned(),
+        };
+
+        app.apply_effect(Effect::AddComment {
+            id: "T-1".to_owned(),
+            author: "TUI Author".to_owned(),
+            text: "Persist me".to_owned(),
+        })
+        .unwrap();
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.detail_checklist, 1);
+        assert_eq!(app.detail_scroll, 4);
+        assert!(!app.detail_follow_cursor);
+        let card = app.project.load_card("T-1").unwrap();
+        let stored = comments::parse(&card.body).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].author, "TUI Author");
+        assert_eq!(stored[0].body, "Persist me");
     }
 
     #[test]
