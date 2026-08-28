@@ -11,6 +11,7 @@ Backlog.md established a compelling Markdown-native workflow for humans and codi
 - Any other JSON-compatible YAML value is a custom field: strings, numbers, booleans, lists, or nested maps.
 - Any ATX heading can be a section. `## Implementation plan`, `## Customer evidence`, and `### Rollout` are conventions you choose, not slots in a fixed template.
 - Any Markdown task list outside a code block is a checklist. A card can have as many independently named checklist sections as it needs.
+- Comments are flat, chronological Markdown records with stable IDs and author attribution. They are intentionally append-only and have no replies or threading.
 - The CLI and TUI share the same model and write the same files.
 
 See the tracked [demo board](examples/demo/.kbmd) for three differently shaped cards.
@@ -134,6 +135,24 @@ kbmd check uncheck-global ACME-1 3
 kbmd check remove-global ACME-1 3
 ```
 
+### Flat comments
+
+Comments are appended in physical document order. They are deliberately simple: there are no replies, threads, edits, or deletes.
+
+```sh
+kbmd comment add ACME-1 "The retry path looks good to me." --author "Ada Lovelace"
+kbmd comments add ACME-1 --file review.md
+printf '%s\n' 'Found one edge case:' '- empty imports' | \
+  kbmd comment add ACME-1 --file -
+
+kbmd comment list ACME-1
+kbmd comment show ACME-1 CMT-0198ef9f-5b52-7a01-b939-54e41a5016b0
+kbmd comment list ACME-1 --json
+kbmd comment show ACME-1 CMT-0198ef9f-5b52-7a01-b939-54e41a5016b0 --json
+```
+
+`comment` has the alias `comments`. A comment author is resolved from `--author`, then `KBMD_AUTHOR`, then the effective Git `user.name`; this is attribution, not identity verification. The first comment creates a `## Comments` section, or adopts a unique existing section with that name without discarding its prose. See [Comments](docs/comments.md) for the Markdown format, author rules, validation, and Git conflict guidance.
+
 ## Live TUI
 
 Launch it with `kbmd` or `kbmd tui`. Wide terminals show the board and selected-card detail side by side; compact terminals use `Tab` to switch between the two panes.
@@ -147,6 +166,7 @@ Launch it with `kbmd` or `kbmd tui`. Wide terminals show the board and selected-
 | `PageUp` / `PageDown` | Scroll the detail pane |
 | `[` / `]` | Move the selected card one status left / right |
 | `n` | Quick-add a title in the active column; `Enter` saves, `Esc` cancels |
+| `c` | Comment on the selected card; `Enter` saves, `Esc` cancels, `Ctrl-U` clears |
 | `r` | Reload the project from disk |
 | `?` | Toggle the in-app help |
 | `q` | Quit |
@@ -156,7 +176,7 @@ Launch it with `kbmd` or `kbmd tui`. Wide terminals show the board and selected-
 
 The TUI watches `.kbmd` and coalesces filesystem events before reloading. It also reconciles from disk periodically, so edits made in an editor or another `kbmd` process appear without restarting. Filesystem notifications can be unreliable on some network-mounted filesystems; press `r` for an immediate refresh if an edit is not visible.
 
-The MVP’s rich editing path remains the CLI or your Markdown editor. The TUI currently focuses on capture, navigation, status changes, and checklist completion.
+The comment composer accepts one line and temporarily blocks mouse actions so a click cannot retarget its draft. For multiline Markdown, use `kbmd comment add CARD --file PATH` or pipe standard input with `--file -`. The MVP’s other rich editing paths remain the CLI or your Markdown editor.
 
 ## On-disk format
 
@@ -253,15 +273,18 @@ Track `.kbmd/config.yml`, `.kbmd/.gitignore`, and the card Markdown files. In a 
 
 Every `kbmd` mutation takes a project lock, reopens the config, re-reads the current cards, validates the collection, and writes through an atomic replacement. Before replacing an existing card, it checks that the source it read has not already changed and asks you to retry instead of knowingly overwriting that change. The lock coordinates `kbmd` processes on the same filesystem; editors and other tools do not participate in it, so Git review and normal conflict resolution still matter.
 
+Comments use file order, not their timestamps, as the conversation order. Branches that append to the same end of a card may therefore produce a normal Git conflict. Keep one comments registry marker and both complete comment blocks in the intended order, then run `kbmd validate`. Git history is the audit trail for this append-only format.
+
 `kbmd` does not commit, merge, push, or fetch for you.
 
 ## Current limitations
 
 - This is format version 1 of an early MVP; keep the board in Git and review upgrades.
 - Unknown frontmatter is preserved semantically only when it fits JSON’s value model: null, booleans, numbers, strings, arrays, and string-keyed maps. YAML tags, anchors, aliases, and non-string mapping keys are not a supported preservation contract.
-- Rewriting a card normalizes frontmatter formatting, key order, quoting, delimiters, and comments. Custom values survive semantically, but YAML presentation and comments do not. The Markdown body is kept separately and unrelated sections are left alone by targeted mutations.
+- Rewriting a card normalizes frontmatter formatting, key order, quoting, delimiters, and YAML comments. Custom values survive semantically, but YAML presentation and YAML comments do not. The Markdown body is kept separately and unrelated sections are left alone by targeted mutations.
 - Section and checklist tools recognize CommonMark ATX headings (`# Heading`) and task-list markers outside code blocks. Setext headings are not sections for CLI purposes. Duplicate case-insensitive section names fail closed.
 - The TUI does not yet provide full Markdown or custom-field editing, and status drops do not implement free ordering within a column.
+- Comments have no replies or threading, and `kbmd` does not provide comment edit or delete commands.
 - There is no web UI, cloud sync, multi-device service, search index, attachments store, authentication, or Git automation.
 - Backlog.md files are not fully compatible, and there is no importer in this MVP.
 
