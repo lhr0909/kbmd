@@ -9,6 +9,8 @@ use std::collections::HashSet;
 use anyhow::{Result, bail};
 use pulldown_cmark::{Event, Options, Parser, Tag};
 
+use crate::comments;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Section {
     pub title: String,
@@ -87,6 +89,7 @@ pub fn section_content(body: &str, title: &str) -> Result<Option<String>> {
 
 pub fn set_section(body: &str, title: &str, content: &str) -> Result<String> {
     validate_heading(title)?;
+    ensure_section_writable(body, title)?;
     if let Some(section) = unique_section(body, title)? {
         Ok(replace_section_content(body, &section, content))
     } else {
@@ -123,6 +126,7 @@ pub fn append_section(body: &str, title: &str, content: &str) -> Result<String> 
 }
 
 pub fn remove_section(body: &str, title: &str) -> Result<String> {
+    ensure_section_writable(body, title)?;
     let Some(section) = unique_section(body, title)? else {
         bail!("section {title:?} was not found");
     };
@@ -198,6 +202,7 @@ pub fn add_checklist_item(body: &str, section: &str, text: &str) -> Result<Strin
                 && candidate.level > target.level
         })
         .map_or(target.end, |child| child.start);
+    ensure_range_writable(body, target.content_start..insertion_end, section)?;
     let direct_content = body[target.content_start..insertion_end].trim_matches(['\r', '\n']);
     let separator = if direct_content.is_empty() {
         ""
@@ -247,6 +252,7 @@ pub fn toggle_checklist_global(body: &str, global_index: usize) -> Result<String
     else {
         bail!("checklist item {global_index} was not found");
     };
+    ensure_item_writable(body, &item)?;
     replace_checkbox(body, &item, !item.checked)
 }
 
@@ -257,6 +263,7 @@ pub fn set_checklist_global(body: &str, global_index: usize, checked: bool) -> R
     else {
         bail!("checklist item {global_index} was not found");
     };
+    ensure_item_writable(body, &item)?;
     replace_checkbox(body, &item, checked)
 }
 
@@ -267,6 +274,7 @@ pub fn remove_checklist_global(body: &str, global_index: usize) -> Result<String
     else {
         bail!("checklist item {global_index} was not found");
     };
+    ensure_item_writable(body, &item)?;
     let mut result = String::with_capacity(body.len() - (item.line_end - item.line_start));
     result.push_str(&body[..item.line_start]);
     result.push_str(&body[item.line_end..]);
@@ -320,7 +328,7 @@ fn checklist_in_section(body: &str, section: &str, index: usize) -> Result<Check
     }
     unique_section(body, section)?
         .ok_or_else(|| anyhow::anyhow!("section {section:?} was not found"))?;
-    checklist_items(body)
+    let item = checklist_items(body)
         .into_iter()
         .find(|item| {
             item.index == index
@@ -331,7 +339,9 @@ fn checklist_in_section(body: &str, section: &str, index: usize) -> Result<Check
         })
         .ok_or_else(|| {
             anyhow::anyhow!("checklist item {index} was not found in section {section:?}")
-        })
+        })?;
+    ensure_item_writable(body, &item)?;
+    Ok(item)
 }
 
 fn replace_checkbox(body: &str, item: &ChecklistItem, checked: bool) -> Result<String> {
@@ -385,13 +395,26 @@ fn commonmark_offsets(body: &str) -> (HashSet<usize>, HashSet<usize>) {
 
     let mut headings = HashSet::new();
     let mut tasks = HashSet::new();
-    let parser = Parser::new_ext(body, Options::ENABLE_TASKLISTS).into_offset_iter();
+    let masked = match comments::masked_content(body) {
+        Ok(masked) => masked,
+        Err(_) => return (headings, tasks),
+    };
+    let protected_comments = match comments::registry_section_range(body) {
+        Ok(range) => range,
+        Err(_) => return (headings, tasks),
+    };
+    let parser = Parser::new_ext(&masked, Options::ENABLE_TASKLISTS).into_offset_iter();
     for (event, range) in parser {
         match event {
             Event::Start(Tag::Heading { .. }) => {
                 headings.insert(source_line_start(body, range.start));
             }
             Event::TaskListMarker(_) => {
+                if protected_comments.as_ref().is_some_and(|protected| {
+                    range.start >= protected.start && range.start < protected.end
+                }) {
+                    continue;
+                }
                 let line_start = source_line_start(body, range.start);
                 let line_end = body[range.start..]
                     .find('\n')
@@ -407,6 +430,42 @@ fn commonmark_offsets(body: &str) -> (HashSet<usize>, HashSet<usize>) {
         }
     }
     (headings, tasks)
+}
+
+fn ensure_section_writable(body: &str, title: &str) -> Result<()> {
+    let Some(protected) = comments::registry_section_range(body)? else {
+        return Ok(());
+    };
+    let Some(section) = unique_section(body, title)? else {
+        return Ok(());
+    };
+    if section.start < protected.end && protected.start < section.end {
+        bail!(
+            "section {title:?} contains structured comments; use `kbmd comment` commands instead"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_item_writable(body: &str, item: &ChecklistItem) -> Result<()> {
+    let label = item.section.as_deref().unwrap_or("(preamble)");
+    ensure_range_writable(body, item.line_start..item.line_end, label)
+}
+
+fn ensure_range_writable(
+    body: &str,
+    candidate: std::ops::Range<usize>,
+    section: &str,
+) -> Result<()> {
+    if let Some(protected) = comments::registry_section_range(body)?
+        && candidate.start < protected.end
+        && protected.start < candidate.end
+    {
+        bail!(
+            "section {section:?} contains structured comments; use `kbmd comment` commands instead"
+        );
+    }
+    Ok(())
 }
 
 fn source_line_start(body: &str, offset: usize) -> usize {
@@ -655,5 +714,87 @@ mod tests {
         let body = "## Before\n\0\n- [ ] unsafe";
         assert!(sections(body).is_empty());
         assert!(checklist_items(body).is_empty());
+    }
+
+    #[test]
+    fn comment_markdown_is_opaque_to_sections_and_checklists() {
+        let base = "# Project\n\n- [ ] real task\n\n## Comments\n\nLegacy context\n";
+        let (body, comment) = comments::append(
+            base,
+            "Alice",
+            "### Suggested work\n\n- [ ] this is discussion, not a task",
+        )
+        .unwrap();
+
+        assert_eq!(
+            sections(&body)
+                .iter()
+                .map(|section| section.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Project", "Comments"]
+        );
+        let items = checklist_items(&body);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "real task");
+        assert_eq!(
+            comments::find(&body, &comment.id).unwrap().body,
+            comment.body
+        );
+    }
+
+    #[test]
+    fn parent_checklists_remain_editable_while_comment_section_is_protected() {
+        let base = "# Project\n\n- [ ] real task\n\n## Comments\n\nLegacy context\n";
+        let (body, comment) = comments::append(base, "Alice", "- [ ] discussion only").unwrap();
+
+        let toggled = toggle_checklist_item(&body, "Project", 1).unwrap();
+        assert!(checklist_items(&toggled)[0].checked);
+        let globally_toggled = toggle_checklist_global(&toggled, 1).unwrap();
+        assert!(!checklist_items(&globally_toggled)[0].checked);
+        let added = add_checklist_item(&globally_toggled, "Project", "second real task").unwrap();
+        assert_eq!(checklist_items(&added).len(), 2);
+        assert_eq!(
+            comments::find(&added, &comment.id).unwrap().body,
+            "- [ ] discussion only"
+        );
+
+        assert!(set_section(&body, "Project", "replacement").is_err());
+        assert!(remove_section(&body, "Project").is_err());
+        assert!(set_section(&body, "Comments", "replacement").is_err());
+        assert!(add_checklist_item(&body, "Comments", "unsafe").is_err());
+    }
+
+    #[test]
+    fn adopted_comment_section_checkboxes_are_not_presented_as_card_work() {
+        let base = "## Comments\n\n- [ ] legacy discussion checkbox\n";
+        let (body, _) = comments::append(base, "Alice", "A normal comment").unwrap();
+
+        assert!(checklist_items(&body).is_empty());
+        assert!(toggle_checklist_global(&body, 1).is_err());
+        assert!(toggle_checklist_item(&body, "Comments", 1).is_err());
+    }
+
+    #[test]
+    fn unclosed_comment_markup_does_not_change_neighboring_markdown_structure() {
+        let base = "# Project\n\n- [ ] project task\n\n## Comments\n\nLegacy.\n\n## Notes\n\n- [ ] notes task\n";
+        for text in ["```md\nunclosed", "<script>\nunclosed", "<style>\nunclosed"] {
+            let (body, _) = comments::append(base, "Alice", text).unwrap();
+            assert_eq!(
+                sections(&body)
+                    .iter()
+                    .map(|section| section.title.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["Project", "Comments", "Notes"],
+                "comment: {text}"
+            );
+            assert_eq!(
+                checklist_items(&body)
+                    .iter()
+                    .map(|item| item.text.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["project task", "notes task"],
+                "comment: {text}"
+            );
+        }
     }
 }
