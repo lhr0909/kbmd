@@ -36,7 +36,6 @@ pub struct CreateCard {
     pub body: String,
     pub labels: Vec<String>,
     pub assignees: Vec<String>,
-    pub due_date: Option<String>,
     pub extra: BTreeMap<String, Value>,
 }
 
@@ -164,7 +163,6 @@ impl Project {
             CardMetadata::new(id.clone(), input.title.trim().to_owned(), status, ordinal);
         metadata.labels = unique_nonempty(input.labels);
         metadata.assignees = unique_nonempty(input.assignees);
-        metadata.due_date = input.due_date.filter(|value| !value.trim().is_empty());
         metadata.extra = input.extra;
         reject_reserved_extra_keys(&metadata.extra)?;
         metadata.validate()?;
@@ -611,14 +609,13 @@ fn unique_nonempty(values: Vec<String>) -> Vec<String> {
 }
 
 fn reject_reserved_extra_keys(extra: &BTreeMap<String, Value>) -> Result<()> {
-    const RESERVED: [&str; 10] = [
+    const RESERVED: [&str; 9] = [
         "id",
         "title",
         "status",
         "labels",
         "assignee",
         "assignees",
-        "due_date",
         "ordinal",
         "created_date",
         "updated_date",
@@ -769,6 +766,92 @@ mod tests {
             serde_json::json!({"points": 3})
         );
         assert_eq!(loaded.body, "## Strange section\n\nNever discard this.\n");
+    }
+
+    #[test]
+    fn legacy_due_date_becomes_custom_metadata_and_survives_a_rewrite() {
+        let (_directory, project) = project();
+        let path = project.cards_dir.join("KB-7.md");
+        fs::write(
+            &path,
+            "---\nid: KB-7\ntitle: Legacy due date\nstatus: Todo\ndue_date: '2026-09-05'\n---\n\n## Notes\n\nKeep this body.\n",
+        )
+        .unwrap();
+
+        let loaded = project.load_card("KB-7").unwrap();
+        assert_eq!(
+            loaded.metadata.extra.get("due_date"),
+            Some(&serde_json::json!("2026-09-05"))
+        );
+
+        project.move_card("KB-7", "Doing").unwrap();
+        let rewritten = project.load_card("KB-7").unwrap();
+        assert_eq!(rewritten.metadata.status, "Doing");
+        assert_eq!(
+            rewritten.metadata.extra.get("due_date"),
+            Some(&serde_json::json!("2026-09-05"))
+        );
+        assert_eq!(rewritten.body, "## Notes\n\nKeep this body.\n");
+        let rewritten_source = fs::read_to_string(path).unwrap();
+        assert_eq!(rewritten_source.matches("\ndue_date:").count(), 1);
+    }
+
+    #[test]
+    fn due_date_can_be_created_and_updated_as_a_custom_field() {
+        let (_directory, project) = project();
+        let mut extra = BTreeMap::new();
+        extra.insert("due_date".to_owned(), serde_json::json!("when-ready"));
+
+        let created = project
+            .create_card(CreateCard {
+                title: "Agent-scheduled work".to_owned(),
+                extra,
+                ..CreateCard::default()
+            })
+            .unwrap();
+        assert_eq!(
+            created.metadata.extra.get("due_date"),
+            Some(&serde_json::json!("when-ready"))
+        );
+
+        project
+            .update_card(&created.metadata.id, |card| {
+                card.metadata.extra.insert(
+                    "due_date".to_owned(),
+                    serde_json::json!({"after": "dependency-ready"}),
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            project
+                .load_card(&created.metadata.id)
+                .unwrap()
+                .metadata
+                .extra
+                .get("due_date"),
+            Some(&serde_json::json!({"after": "dependency-ready"}))
+        );
+    }
+
+    #[test]
+    fn other_canonical_field_names_remain_reserved_for_custom_metadata() {
+        for key in [
+            "id",
+            "title",
+            "status",
+            "labels",
+            "assignee",
+            "assignees",
+            "ordinal",
+            "created_date",
+            "updated_date",
+        ] {
+            let mut extra = BTreeMap::new();
+            extra.insert(key.to_ascii_uppercase(), Value::Null);
+            let error = reject_reserved_extra_keys(&extra).unwrap_err();
+            assert!(error.to_string().contains("reserved card field"));
+        }
     }
 
     #[test]

@@ -22,8 +22,6 @@ pub struct CardMetadata {
     )]
     pub assignees: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub due_date: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ordinal: Option<i64>,
     #[serde(default = "now", skip_serializing_if = "String::is_empty")]
     pub created_date: String,
@@ -50,7 +48,6 @@ impl CardMetadata {
             status,
             labels: Vec::new(),
             assignees: Vec::new(),
-            due_date: None,
             ordinal: Some(ordinal),
             created_date: timestamp.clone(),
             updated_date: timestamp,
@@ -82,9 +79,6 @@ impl CardMetadata {
         }
         for assignee in &self.assignees {
             reject_control_characters("card assignees", assignee)?;
-        }
-        if let Some(due_date) = &self.due_date {
-            reject_control_characters("card due date", due_date)?;
         }
         Ok(())
     }

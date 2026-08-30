@@ -72,12 +72,13 @@ Each card is a single YAML-frontmatter Markdown document. The reserved metadata 
 | `status` | One configured column name |
 | `labels` | Optional string list |
 | `assignees` | Optional string list; singular `assignee` is accepted on read |
-| `due_date` | Optional user-supplied string |
 | `ordinal` | Optional signed integer used to order a column |
 | `created_date` | UTC RFC 3339 timestamp for CLI-created cards |
 | `updated_date` | UTC RFC 3339 timestamp touched by mutations |
 
-All other top-level keys are flattened custom data. Custom keys cannot case-insensitively collide with a reserved field. They are stored in a `BTreeMap`, making top-level serialization deterministic rather than preserving source key placement.
+These are eight canonical serialized fields, of which only `id`, `title`, and `status` are required. The singular `assignee` spelling is additionally reserved as a read alias for `assignees`.
+
+All other top-level keys are flattened custom data. Custom keys cannot case-insensitively collide with a reserved field. They are stored in a `BTreeMap`, making top-level serialization deterministic rather than preserving source key placement. Existing top-level `due_date` values therefore migrate losslessly into custom metadata when a card is rewritten; `kbmd` no longer gives them date validation, scheduling, reminders, or other special behavior.
 
 The body remains an opaque string except during an explicit section or checklist operation. [pulldown-cmark](https://docs.rs/pulldown-cmark/0.13.4/pulldown_cmark/) supplies CommonMark events and source ranges; a narrow line scanner then locates the exact source bytes to mutate. This hybrid avoids treating indented code or fenced examples as live card structure without rendering and reserializing the user’s Markdown. It:
 

@@ -96,8 +96,6 @@ struct AddArgs {
     labels: Vec<String>,
     #[arg(long = "assignee")]
     assignees: Vec<String>,
-    #[arg(long)]
-    due: Option<String>,
     /// Complete Markdown body.
     #[arg(long, conflicts_with = "body_file", allow_hyphen_values = true)]
     body: Option<String>,
@@ -150,10 +148,6 @@ struct EditArgs {
     title: Option<String>,
     #[arg(long)]
     status: Option<String>,
-    #[arg(long)]
-    due: Option<String>,
-    #[arg(long, conflicts_with = "due")]
-    clear_due: bool,
     #[arg(long = "add-label")]
     add_labels: Vec<String>,
     #[arg(long = "remove-label")]
@@ -421,7 +415,6 @@ fn command_add(start: &Path, arguments: AddArgs) -> Result<()> {
         body,
         labels: arguments.labels,
         assignees: arguments.assignees,
-        due_date: arguments.due,
         extra,
     })?;
     if arguments.json {
@@ -493,9 +486,6 @@ fn command_show(start: &Path, arguments: ShowArgs) -> Result<()> {
     if !card.metadata.assignees.is_empty() {
         println!("Assignees: {}", card.metadata.assignees.join(", "));
     }
-    if let Some(due) = &card.metadata.due_date {
-        println!("Due: {due}");
-    }
     if total > 0 {
         println!("Checklist: {checked}/{total}");
     }
@@ -512,8 +502,6 @@ fn command_show(start: &Path, arguments: ShowArgs) -> Result<()> {
 fn command_edit(start: &Path, arguments: EditArgs) -> Result<()> {
     if arguments.title.is_none()
         && arguments.status.is_none()
-        && arguments.due.is_none()
-        && !arguments.clear_due
         && arguments.add_labels.is_empty()
         && arguments.remove_labels.is_empty()
         && arguments.add_assignees.is_empty()
@@ -528,11 +516,6 @@ fn command_edit(start: &Path, arguments: EditArgs) -> Result<()> {
         }
         if let Some(status) = &arguments.status {
             card.metadata.status.clone_from(status);
-        }
-        if arguments.clear_due {
-            card.metadata.due_date = None;
-        } else if let Some(due) = &arguments.due {
-            card.metadata.due_date = Some(due.clone());
         }
         extend_unique(&mut card.metadata.labels, &arguments.add_labels);
         remove_values(&mut card.metadata.labels, &arguments.remove_labels);
@@ -874,14 +857,13 @@ fn parse_yaml_value(source: &str) -> Result<Value> {
 }
 
 fn ensure_custom_key(key: &str) -> Result<()> {
-    const RESERVED: [&str; 10] = [
+    const RESERVED: [&str; 9] = [
         "id",
         "title",
         "status",
         "labels",
         "assignee",
         "assignees",
-        "due_date",
         "ordinal",
         "created_date",
         "updated_date",
@@ -1013,6 +995,7 @@ mod tests {
     fn reserved_keys_cannot_be_custom_fields() {
         assert!(ensure_custom_key("status").is_err());
         assert!(ensure_custom_key("STATUS").is_err());
+        assert!(ensure_custom_key("due_date").is_ok());
         assert!(ensure_custom_key("estimate").is_ok());
     }
 
