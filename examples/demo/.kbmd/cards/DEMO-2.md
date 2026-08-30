@@ -7,7 +7,6 @@ labels:
 - tui
 assignees:
 - simon
-due_date: '2026-09-05'
 ordinal: 1024
 created_date: '2026-08-27T02:00:00Z'
 updated_date: '2026-08-27T04:15:00Z'

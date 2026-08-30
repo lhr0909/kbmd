@@ -7,7 +7,7 @@ Backlog.md established a compelling Markdown-native workflow for humans and codi
 ## What is flexible?
 
 - Columns are an ordered list in `.kbmd/config.yml`, with optional colors and work-in-progress limits.
-- Only `id`, `title`, and `status` are required on a card. Labels, assignees, due dates, ordering, and timestamps are canonical but lightweight.
+- Only `id`, `title`, and `status` are required on a card. Labels, assignees, ordering, and timestamps are optional canonical fields.
 - Any other JSON-compatible YAML value is a custom field: strings, numbers, booleans, lists, or nested maps.
 - Any ATX heading can be a section. `## Implementation plan`, `## Customer evidence`, and `### Rollout` are conventions you choose, not slots in a fixed template.
 - Any Markdown task list outside a code block is a checklist. A card can have as many independently named checklist sections as it needs.
@@ -62,7 +62,7 @@ Running `kbmd` with no subcommand also opens the TUI. Commands discover the near
 ### Create, inspect, edit, and move cards
 
 ```sh
-kbmd add "Document the release" --status Ready --assignee simon --due 2026-09-05
+kbmd add "Document the release" --status Ready --assignee simon
 kbmd list
 kbmd list --status Doing --label mvp
 kbmd show ACME-1
@@ -95,7 +95,7 @@ kbmd field get ACME-1 estimate
 kbmd field unset ACME-1 blocked-by
 ```
 
-Custom fields may not reuse reserved names: `id`, `title`, `status`, `labels`, `assignee`, `assignees`, `due_date`, `ordinal`, `created_date`, or `updated_date`.
+Custom fields may not reuse reserved names: `id`, `title`, `status`, `labels`, `assignee`, `assignees`, `ordinal`, `created_date`, or `updated_date`.
 
 ### Arbitrary Markdown sections
 
@@ -212,7 +212,6 @@ labels:
 - telemetry
 assignees:
 - simon
-due_date: '2026-09-05'
 ordinal: 2048
 created_date: '2026-08-27T09:00:00Z'
 updated_date: '2026-08-27T10:15:00Z'
@@ -246,6 +245,8 @@ The section names and nesting are project conventions, not `kbmd` schema.
 ```
 
 `ordinal` controls ordering within a column. New cards and cards moved to a new status are appended after the largest ordinal there.
+
+The canonical card schema has eight fields: `id`, `title`, `status`, `labels`, `assignees`, `ordinal`, `created_date`, and `updated_date`; only the first three are required. `assignee` is also reserved as a legacy read alias for `assignees`. Existing cards with a top-level `due_date` keep that value as ordinary custom metadata when rewritten, so removing the canonical field does not discard project data. `kbmd` no longer gives it date validation, scheduling, reminders, or other special behavior.
 
 ## Git and concurrent writers
 
