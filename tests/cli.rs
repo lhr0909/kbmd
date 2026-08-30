@@ -132,6 +132,99 @@ fn custom_fields_keep_string_and_typed_yaml_semantics() {
 }
 
 #[test]
+fn due_date_is_an_ordinary_custom_field() {
+    let directory = initialized();
+    kbmd(directory.path())
+        .args(["add", "Flexible date", "--field", "due_date=next sprint"])
+        .assert()
+        .success();
+
+    kbmd(directory.path())
+        .args(["field", "get", "DEMO-1", "due_date"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("next sprint"));
+
+    let output = kbmd(directory.path())
+        .args(["show", "DEMO-1", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["data"]["metadata"]["due_date"], "next sprint");
+
+    kbmd(directory.path())
+        .args([
+            "field",
+            "set",
+            "DEMO-1",
+            "due_date",
+            "{kind: relative, days: 3}",
+            "--yaml",
+        ])
+        .assert()
+        .success();
+
+    let output = kbmd(directory.path())
+        .args(["show", "DEMO-1", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["data"]["metadata"]["due_date"],
+        serde_json::json!({"kind": "relative", "days": 3})
+    );
+
+    kbmd(directory.path())
+        .args(["field", "unset", "DEMO-1", "due_date"])
+        .assert()
+        .success();
+
+    let output = kbmd(directory.path())
+        .args(["show", "DEMO-1", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        !json["data"]["metadata"]
+            .as_object()
+            .unwrap()
+            .contains_key("due_date")
+    );
+}
+
+#[test]
+fn dedicated_due_date_flags_are_rejected() {
+    let directory = initialized();
+
+    kbmd(directory.path())
+        .args(["add", "No dedicated due date", "--due", "tomorrow"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--due"));
+    assert!(!directory.path().join(".kbmd/cards/DEMO-1.md").exists());
+
+    kbmd(directory.path())
+        .args(["add", "Editable"])
+        .assert()
+        .success();
+
+    kbmd(directory.path())
+        .args(["edit", "DEMO-1", "--due", "tomorrow"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--due"));
+
+    kbmd(directory.path())
+        .args(["edit", "DEMO-1", "--clear-due"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--clear-due"));
+}
+
+#[test]
 fn body_can_be_read_from_stdin() {
     let directory = initialized();
     kbmd(directory.path())
