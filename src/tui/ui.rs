@@ -138,24 +138,12 @@ fn render_main(frame: &mut Frame<'_>, app: &App, area: Rect, hit_map: &mut HitMa
 
 fn render_board(frame: &mut Frame<'_>, app: &App, area: Rect, hit_map: &mut HitMap) {
     hit_map.push(area, HitTarget::BoardPane);
-    let focused = app.focus == Focus::Board;
-    let border = if focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border))
-        .title(" Board ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
 
-    if app.project.config.columns.is_empty() || inner.width == 0 || inner.height == 0 {
+    if app.project.config.columns.is_empty() || area.width == 0 || area.height == 0 {
         return;
     }
 
-    let columns = column_rects(app, inner);
+    let columns = column_rects(app, area);
     for (column_index, rect) in columns {
         render_column(frame, app, column_index, rect, hit_map);
     }
@@ -738,6 +726,41 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn board_columns_fill_the_unframed_board_pane() {
+        let (_directory, app) = app();
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut hit_map = HitMap::default();
+
+        terminal
+            .draw(|frame| hit_map = render(frame, &app))
+            .unwrap();
+
+        let board = hit_map
+            .regions
+            .iter()
+            .find(|region| matches!(region.target, HitTarget::BoardPane))
+            .unwrap()
+            .rect;
+        let columns = hit_map
+            .regions
+            .iter()
+            .filter_map(|region| {
+                matches!(region.target, HitTarget::Column(_)).then_some(region.rect)
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!columns.is_empty());
+        assert_eq!(columns.first().unwrap().x, board.x);
+        assert_eq!(columns.last().unwrap().right(), board.right());
+        assert!(
+            columns
+                .iter()
+                .all(|column| column.y == board.y && column.height == board.height)
+        );
     }
 
     #[test]
